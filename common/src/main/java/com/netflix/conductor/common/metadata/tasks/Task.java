@@ -27,28 +27,61 @@ import com.netflix.conductor.common.metadata.workflow.WorkflowTask;
 import com.google.protobuf.Any;
 import io.swagger.v3.oas.annotations.Hidden;
 
+/**
+ * 任务（Task）模型类。
+ *
+ * <p>表示 Conductor 工作流中一个具体的任务实例，包含任务类型、状态、输入输出数据、时间信息、
+ * 重试信息、工作流关联信息等。它是工作流执行过程中任务调度的核心数据结构。
+ *
+ * <p>该类通过 {@link ProtoMessage} 和 {@link ProtoField} 注解支持 Protobuf 序列化，
+ * 字段的 id 对应 Protobuf 中的字段编号。
+ */
 @ProtoMessage
 public class Task {
 
+    /**
+     * 任务状态枚举。
+     *
+     * <p>每个状态包含三个布尔属性：
+     * <ul>
+     *   <li>{@code terminal}：是否为终态，终态任务不会再发生变化</li>
+     *   <li>{@code successful}：是否表示成功完成</li>
+     *   <li>{@code retriable}：是否允许重试</li>
+     * </ul>
+     */
     @ProtoEnum
     public enum Status {
+        /** 任务正在执行中 */
         IN_PROGRESS(false, true, true),
+        /** 任务被取消 */
         CANCELED(true, false, false),
+        /** 任务执行失败，可重试 */
         FAILED(true, false, true),
+        /**
+         * 任务因终端错误失败。
+         * 即使配置了重试也不会重试，任务及关联工作流应被终止。
+         */
         FAILED_WITH_TERMINAL_ERROR(
                 true, false,
-                false), // No retries even if retries are configured, the task and the related
-        // workflow should be terminated
+                false), // 即使配置了重试也不会重试，任务和关联的工作流应被终止
+        /** 任务成功完成 */
         COMPLETED(true, true, true),
+        /** 任务完成但带有错误 */
         COMPLETED_WITH_ERRORS(true, true, true),
+        /** 任务已调度但尚未开始 */
         SCHEDULED(false, true, true),
+        /** 任务超时 */
         TIMED_OUT(true, false, true),
+        /** 任务被跳过 */
         SKIPPED(true, true, false);
 
+        /** 是否为终态 */
         private final boolean terminal;
 
+        /** 是否成功 */
         private final boolean successful;
 
+        /** 是否可重试 */
         private final boolean retriable;
 
         Status(boolean terminal, boolean successful, boolean retriable) {
@@ -70,134 +103,168 @@ public class Task {
         }
     }
 
+    /** 任务类型，例如 HTTP、SIMPLE、SUB_WORKFLOW 等 */
     @ProtoField(id = 1)
     private String taskType;
 
+    /** 任务当前状态 */
     @ProtoField(id = 2)
     private Status status;
 
+    /** 任务输入数据 */
     @ProtoField(id = 3)
     private Map<String, Object> inputData = new HashMap<>();
 
+    /** 任务引用名称，通常用于在工作流定义中标识任务 */
     @ProtoField(id = 4)
     private String referenceTaskName;
 
+    /** 重试次数 */
     @ProtoField(id = 5)
     private int retryCount;
 
+    /** 任务在工作流中的序号 */
     @ProtoField(id = 6)
     private int seq;
 
+    /** 关联 ID，用于关联外部系统或业务标识 */
     @ProtoField(id = 7)
     private String correlationId;
 
+    /** 任务被轮询的次数 */
     @ProtoField(id = 8)
     private int pollCount;
 
+    /** 任务定义名称 */
     @ProtoField(id = 9)
     private String taskDefName;
 
-    /** Time when the task was scheduled */
+    /** 任务被调度的时间 */
     @ProtoField(id = 10)
     private long scheduledTime;
 
-    /** Time when the task was first polled */
+    /** 任务第一次被轮询的时间 */
     @ProtoField(id = 11)
     private long startTime;
 
-    /** Time when the task completed executing */
+    /** 任务执行完成的时间 */
     @ProtoField(id = 12)
     private long endTime;
 
-    /** Time when the task was last updated */
+    /** 任务最后一次更新的时间 */
     @ProtoField(id = 13)
     private long updateTime;
 
+    /** 任务开始前的延迟时间（秒） */
     @ProtoField(id = 14)
     private int startDelayInSeconds;
 
+    /** 重试任务 ID */
     @ProtoField(id = 15)
     private String retriedTaskId;
 
+    /** 该任务是否已经被重试过 */
     @ProtoField(id = 16)
     private boolean retried;
 
+    /** 该任务是否已经在 Conductor 中完成整个生命周期（从开始到完成并更新到数据存储） */
     @ProtoField(id = 17)
     private boolean executed;
 
+    /** 是否由 worker 回调，默认为 true */
     @ProtoField(id = 18)
     private boolean callbackFromWorker = true;
 
+    /** 响应超时时间（秒），超过该时间任务会被重新入队 */
     @ProtoField(id = 19)
     private long responseTimeoutSeconds;
 
+    /** 工作流实例 ID */
     @ProtoField(id = 20)
     private String workflowInstanceId;
 
+    /** 工作流类型/名称 */
     @ProtoField(id = 21)
     private String workflowType;
 
+    /** 任务 ID */
     @ProtoField(id = 22)
     private String taskId;
 
+    /** 任务未完成的原因 */
     @ProtoField(id = 23)
     private String reasonForIncompletion;
 
+    /** 回调延迟时间（秒） */
     @ProtoField(id = 24)
     private long callbackAfterSeconds;
 
+    /** 执行该任务的 worker ID */
     @ProtoField(id = 25)
     private String workerId;
 
+    /** 任务输出数据 */
     @ProtoField(id = 26)
     private Map<String, Object> outputData = new HashMap<>();
 
+    /** 工作流任务定义 */
     @ProtoField(id = 27)
     private WorkflowTask workflowTask;
 
+    /** 域（Domain）信息，用于多租户或隔离 */
     @ProtoField(id = 28)
     private String domain;
 
+    /** 输入消息（Protobuf Any 类型），不对外暴露 */
     @ProtoField(id = 29)
     @Hidden
     private Any inputMessage;
 
+    /** 输出消息（Protobuf Any 类型），不对外暴露 */
     @ProtoField(id = 30)
     @Hidden
     private Any outputMessage;
 
-    // id 31 is reserved
+    // id 31 保留
 
+    /** 每个频率允许的速率限制 */
     @ProtoField(id = 32)
     private int rateLimitPerFrequency;
 
+    /** 速率限制频率（秒） */
     @ProtoField(id = 33)
     private int rateLimitFrequencyInSeconds;
 
+    /** 外部输入负载存储路径 */
     @ProtoField(id = 34)
     private String externalInputPayloadStoragePath;
 
+    /** 外部输出负载存储路径 */
     @ProtoField(id = 35)
     private String externalOutputPayloadStoragePath;
 
+    /** 工作流优先级 */
     @ProtoField(id = 36)
     private int workflowPriority;
 
+    /** 执行命名空间 */
     @ProtoField(id = 37)
     private String executionNameSpace;
 
+    /** 隔离组 ID */
     @ProtoField(id = 38)
     private String isolationGroupId;
 
+    /** 迭代次数，用于循环任务 */
     @ProtoField(id = 40)
     private int iteration;
 
+    /** 子工作流 ID */
     @ProtoField(id = 41)
     private String subWorkflowId;
 
     /**
-     * Use to note that a sub workflow associated with SUB_WORKFLOW task has an action performed on
-     * it directly.
+     * 用于标记与 SUB_WORKFLOW 任务关联的子工作流是否被直接操作过。
      */
     @ProtoField(id = 42)
     private boolean subworkflowChanged;
@@ -205,7 +272,7 @@ public class Task {
     public Task() {}
 
     /**
-     * @return Type of the task
+     * @return 任务类型
      * @see TaskType
      */
     public String getTaskType() {
@@ -217,14 +284,14 @@ public class Task {
     }
 
     /**
-     * @return Status of the task
+     * @return 任务状态
      */
     public Status getStatus() {
         return status;
     }
 
     /**
-     * @param status Status of the task
+     * @param status 任务状态
      */
     public void setStatus(Status status) {
         this.status = status;
@@ -242,147 +309,152 @@ public class Task {
     }
 
     /**
-     * @return the referenceTaskName
+     * @return 引用任务名称
      */
     public String getReferenceTaskName() {
         return referenceTaskName;
     }
 
     /**
-     * @param referenceTaskName the referenceTaskName to set
+     * @param referenceTaskName 引用任务名称
      */
     public void setReferenceTaskName(String referenceTaskName) {
         this.referenceTaskName = referenceTaskName;
     }
 
     /**
-     * @return the correlationId
+     * @return 关联 ID
      */
     public String getCorrelationId() {
         return correlationId;
     }
 
     /**
-     * @param correlationId the correlationId to set
+     * @param correlationId 关联 ID
      */
     public void setCorrelationId(String correlationId) {
         this.correlationId = correlationId;
     }
 
     /**
-     * @return the retryCount
+     * @return 重试次数
      */
     public int getRetryCount() {
         return retryCount;
     }
 
     /**
-     * @param retryCount the retryCount to set
+     * @param retryCount 重试次数
      */
     public void setRetryCount(int retryCount) {
         this.retryCount = retryCount;
     }
 
     /**
-     * @return the scheduledTime
+     * @return 调度时间
      */
     public long getScheduledTime() {
         return scheduledTime;
     }
 
     /**
-     * @param scheduledTime the scheduledTime to set
+     * @param scheduledTime 调度时间
      */
     public void setScheduledTime(long scheduledTime) {
         this.scheduledTime = scheduledTime;
     }
 
     /**
-     * @return the startTime
+     * @return 开始时间
      */
     public long getStartTime() {
         return startTime;
     }
 
     /**
-     * @param startTime the startTime to set
+     * @param startTime 开始时间
      */
     public void setStartTime(long startTime) {
         this.startTime = startTime;
     }
 
     /**
-     * @return the endTime
+     * @return 结束时间
      */
     public long getEndTime() {
         return endTime;
     }
 
     /**
-     * @param endTime the endTime to set
+     * @param endTime 结束时间
      */
     public void setEndTime(long endTime) {
         this.endTime = endTime;
     }
 
     /**
-     * @return the startDelayInSeconds
+     * @return 开始延迟时间（秒）
      */
     public int getStartDelayInSeconds() {
         return startDelayInSeconds;
     }
 
     /**
-     * @param startDelayInSeconds the startDelayInSeconds to set
+     * @param startDelayInSeconds 开始延迟时间（秒）
      */
     public void setStartDelayInSeconds(int startDelayInSeconds) {
         this.startDelayInSeconds = startDelayInSeconds;
     }
 
     /**
-     * @return the retriedTaskId
+     * @return 重试任务 ID
      */
     public String getRetriedTaskId() {
         return retriedTaskId;
     }
 
     /**
-     * @param retriedTaskId the retriedTaskId to set
+     * @param retriedTaskId 重试任务 ID
      */
     public void setRetriedTaskId(String retriedTaskId) {
         this.retriedTaskId = retriedTaskId;
     }
 
     /**
-     * @return the seq
+     * @return 任务序号
      */
     public int getSeq() {
         return seq;
     }
 
     /**
-     * @param seq the seq to set
+     * @param seq 任务序号
      */
     public void setSeq(int seq) {
         this.seq = seq;
     }
 
     /**
-     * @return the updateTime
+     * @return 最后更新时间
      */
     public long getUpdateTime() {
         return updateTime;
     }
 
     /**
-     * @param updateTime the updateTime to set
+     * @param updateTime 最后更新时间
      */
     public void setUpdateTime(long updateTime) {
         this.updateTime = updateTime;
     }
 
     /**
-     * @return the queueWaitTime
+     * 计算队列等待时间。
+     *
+     * <p>如果任务已经回调并且设置了 callbackAfterSeconds，则返回从预期回调时间到现在的等待时间；
+     * 否则返回 startTime - scheduledTime。
+     *
+     * @return 队列等待时间（毫秒）
      */
     public long getQueueWaitTime() {
         if (this.startTime > 0 && this.scheduledTime > 0) {
@@ -399,36 +471,35 @@ public class Task {
     }
 
     /**
-     * @return True if the task has been retried after failure
+     * @return 任务失败后是否已被重试
      */
     public boolean isRetried() {
         return retried;
     }
 
     /**
-     * @param retried the retried to set
+     * @param retried 是否已被重试
      */
     public void setRetried(boolean retried) {
         this.retried = retried;
     }
 
     /**
-     * @return True if the task has completed its lifecycle within conductor (from start to
-     *     completion to being updated in the datastore)
+     * @return 任务是否已在 Conductor 中完成整个生命周期（从开始到完成并更新到数据存储）
      */
     public boolean isExecuted() {
         return executed;
     }
 
     /**
-     * @param executed the executed value to set
+     * @param executed 是否已执行完成
      */
     public void setExecuted(boolean executed) {
         this.executed = executed;
     }
 
     /**
-     * @return No. of times task has been polled
+     * @return 任务被轮询的次数
      */
     public int getPollCount() {
         return pollCount;
@@ -438,6 +509,7 @@ public class Task {
         this.pollCount = pollCount;
     }
 
+    /** 增加轮询计数 */
     public void incrementPollCount() {
         ++this.pollCount;
     }
@@ -451,7 +523,9 @@ public class Task {
     }
 
     /**
-     * @return Name of the task definition
+     * 获取任务定义名称。如果未设置，则回退到任务类型。
+     *
+     * @return 任务定义名称
      */
     public String getTaskDefName() {
         if (taskDefName == null || "".equals(taskDefName)) {
@@ -461,36 +535,35 @@ public class Task {
     }
 
     /**
-     * @param taskDefName Name of the task definition
+     * @param taskDefName 任务定义名称
      */
     public void setTaskDefName(String taskDefName) {
         this.taskDefName = taskDefName;
     }
 
     /**
-     * @return the timeout for task to send response. After this timeout, the task will be re-queued
+     * @return 任务响应超时时间（秒），超过该时间任务会被重新入队
      */
     public long getResponseTimeoutSeconds() {
         return responseTimeoutSeconds;
     }
 
     /**
-     * @param responseTimeoutSeconds - timeout for task to send response. After this timeout, the
-     *     task will be re-queued
+     * @param responseTimeoutSeconds 任务响应超时时间（秒）
      */
     public void setResponseTimeoutSeconds(long responseTimeoutSeconds) {
         this.responseTimeoutSeconds = responseTimeoutSeconds;
     }
 
     /**
-     * @return the workflowInstanceId
+     * @return 工作流实例 ID
      */
     public String getWorkflowInstanceId() {
         return workflowInstanceId;
     }
 
     /**
-     * @param workflowInstanceId the workflowInstanceId to set
+     * @param workflowInstanceId 工作流实例 ID
      */
     public void setWorkflowInstanceId(String workflowInstanceId) {
         this.workflowInstanceId = workflowInstanceId;
@@ -501,8 +574,10 @@ public class Task {
     }
 
     /**
-     * @param workflowType the name of the workflow
-     * @return the task object with the workflow type set
+     * 设置工作流类型，并返回当前任务对象以便链式调用。
+     *
+     * @param workflowType 工作流名称
+     * @return 当前任务对象
      */
     public com.netflix.conductor.common.metadata.tasks.Task setWorkflowType(String workflowType) {
         this.workflowType = workflowType;
@@ -510,70 +585,72 @@ public class Task {
     }
 
     /**
-     * @return the taskId
+     * @return 任务 ID
      */
     public String getTaskId() {
         return taskId;
     }
 
     /**
-     * @param taskId the taskId to set
+     * @param taskId 任务 ID
      */
     public void setTaskId(String taskId) {
         this.taskId = taskId;
     }
 
     /**
-     * @return the reasonForIncompletion
+     * @return 任务未完成的原因
      */
     public String getReasonForIncompletion() {
         return reasonForIncompletion;
     }
 
     /**
-     * @param reasonForIncompletion the reasonForIncompletion to set
+     * 设置任务未完成原因，最长保留 500 个字符。
+     *
+     * @param reasonForIncompletion 未完成原因
      */
     public void setReasonForIncompletion(String reasonForIncompletion) {
         this.reasonForIncompletion = StringUtils.substring(reasonForIncompletion, 0, 500);
     }
 
     /**
-     * @return the callbackAfterSeconds
+     * @return 回调延迟时间（秒）
      */
     public long getCallbackAfterSeconds() {
         return callbackAfterSeconds;
     }
 
     /**
-     * @param callbackAfterSeconds the callbackAfterSeconds to set
+     * @param callbackAfterSeconds 回调延迟时间（秒）
      */
     public void setCallbackAfterSeconds(long callbackAfterSeconds) {
         this.callbackAfterSeconds = callbackAfterSeconds;
     }
 
     /**
-     * @return the workerId
+     * @return worker ID
      */
     public String getWorkerId() {
         return workerId;
     }
 
     /**
-     * @param workerId the workerId to set
+     * @param workerId worker ID
      */
     public void setWorkerId(String workerId) {
         this.workerId = workerId;
     }
 
     /**
-     * @return the outputData
+     * @return 输出数据
      */
     public Map<String, Object> getOutputData() {
         return outputData;
     }
 
     /**
-     * @param outputData the outputData to set
+     * @param outputData 输出数据
      */
     public void setOutputData(Map<String, Object> outputData) {
         if (outputData == null) {
@@ -583,28 +660,28 @@ public class Task {
     }
 
     /**
-     * @return Workflow Task definition
+     * @return 工作流任务定义
      */
     public WorkflowTask getWorkflowTask() {
         return workflowTask;
     }
 
     /**
-     * @param workflowTask Task definition
+     * @param workflowTask 工作流任务定义
      */
     public void setWorkflowTask(WorkflowTask workflowTask) {
         this.workflowTask = workflowTask;
     }
 
     /**
-     * @return the domain
+     * @return 域信息
      */
     public String getDomain() {
         return domain;
     }
 
     /**
-     * @param domain the Domain
+     * @param domain 域信息
      */
     public void setDomain(String domain) {
         this.domain = domain;
@@ -627,7 +704,9 @@ public class Task {
     }
 
     /**
-     * @return {@link Optional} containing the task definition if available
+     * 获取任务定义（如果可用）。
+     *
+     * @return 包含任务定义的 {@link Optional}
      */
     public Optional<TaskDef> getTaskDefinition() {
         return Optional.ofNullable(this.getWorkflowTask()).map(WorkflowTask::getTaskDefinition);
@@ -650,30 +729,28 @@ public class Task {
     }
 
     /**
-     * @return the external storage path for the task input payload
+     * @return 任务输入负载的外部存储路径
      */
     public String getExternalInputPayloadStoragePath() {
         return externalInputPayloadStoragePath;
     }
 
     /**
-     * @param externalInputPayloadStoragePath the external storage path where the task input payload
-     *     is stored
+     * @param externalInputPayloadStoragePath 任务输入负载的外部存储路径
      */
     public void setExternalInputPayloadStoragePath(String externalInputPayloadStoragePath) {
         this.externalInputPayloadStoragePath = externalInputPayloadStoragePath;
     }
 
     /**
-     * @return the external storage path for the task output payload
+     * @return 任务输出负载的外部存储路径
      */
     public String getExternalOutputPayloadStoragePath() {
         return externalOutputPayloadStoragePath;
     }
 
     /**
-     * @param externalOutputPayloadStoragePath the external storage path where the task output
-     *     payload is stored
+     * @param externalOutputPayloadStoragePath 任务输出负载的外部存储路径
      */
     public void setExternalOutputPayloadStoragePath(String externalOutputPayloadStoragePath) {
         this.externalOutputPayloadStoragePath = externalOutputPayloadStoragePath;
@@ -696,30 +773,35 @@ public class Task {
     }
 
     /**
-     * @return the iteration
+     * @return 迭代次数
      */
     public int getIteration() {
         return iteration;
     }
 
     /**
-     * @param iteration iteration
+     * @param iteration 迭代次数
      */
     public void setIteration(int iteration) {
         this.iteration = iteration;
     }
 
+    /**
+     * 是否为循环任务（迭代次数大于 0）。
+     *
+     * @return 如果是循环任务返回 true
+     */
     public boolean isLoopOverTask() {
         return iteration > 0;
     }
 
-    /** * @return the priority defined on workflow */
+    /** @return 工作流上定义的优先级 */
     public int getWorkflowPriority() {
         return workflowPriority;
     }
 
     /**
-     * @param workflowPriority Priority defined for workflow
+     * @param workflowPriority 工作流优先级
      */
     public void setWorkflowPriority(int workflowPriority) {
         this.workflowPriority = workflowPriority;
@@ -733,27 +815,49 @@ public class Task {
         this.subworkflowChanged = subworkflowChanged;
     }
 
+    /**
+     * 获取子工作流 ID。
+     *
+     * <p>为了向后兼容，如果 {@code subWorkflowId} 为空，则会尝试从输出数据或输入数据中获取
+     * {@code subWorkflowId}。
+     *
+     * @return 子工作流 ID，可能为 null
+     */
     public String getSubWorkflowId() {
-        // For backwards compatibility
+        // 向后兼容
         if (StringUtils.isNotBlank(subWorkflowId)) {
             return subWorkflowId;
         } else {
             return this.getOutputData() != null && this.getOutputData().get("subWorkflowId") != null
                     ? (String) this.getOutputData().get("subWorkflowId")
                     : this.getInputData() != null
-                            ? (String) this.getInputData().get("subWorkflowId")
-                            : null;
+                    ? (String) this.getInputData().get("subWorkflowId")
+                    : null;
         }
     }
 
+    /**
+     * 设置子工作流 ID。
+     *
+     * <p>为了向后兼容，如果输出数据中已存在 {@code subWorkflowId}，也会同步更新。
+     *
+     * @param subWorkflowId 子工作流 ID
+     */
     public void setSubWorkflowId(String subWorkflowId) {
         this.subWorkflowId = subWorkflowId;
-        // For backwards compatibility
+        // 向后兼容
         if (this.getOutputData() != null && this.getOutputData().containsKey("subWorkflowId")) {
             this.getOutputData().put("subWorkflowId", subWorkflowId);
         }
     }
 
+    /**
+     * 创建当前任务的一个浅拷贝。
+     *
+     * <p>注意：拷贝过程中不会复制 {@code retried}、{@code updateTime}、{@code retriedTaskId} 等字段。
+     *
+     * @return 任务副本
+     */
     public Task copy() {
         Task copy = new Task();
         copy.setCallbackAfterSeconds(callbackAfterSeconds);
@@ -791,13 +895,19 @@ public class Task {
     }
 
     /**
-     * @return a deep copy of the task instance To be used inside copy Workflow method to provide a
-     *     valid deep copied object. Note: This does not copy the following fields:
-     *     <ul>
-     *       <li>retried
-     *       <li>updateTime
-     *       <li>retriedTaskId
-     *     </ul>
+     * 创建当前任务的深拷贝。
+     *
+     * <p>在 {@link #copy()} 的基础上，额外复制了时间、worker、完成原因、序号等字段。
+     * 用于 copy Workflow 方法中提供有效的深拷贝对象。
+     *
+     * <p>注意：以下字段不会被复制：
+     * <ul>
+     *   <li>retried</li>
+     *   <li>updateTime</li>
+     *   <li>retriedTaskId</li>
+     * </ul>
+     *
+     * @return 任务深拷贝
      */
     public Task deepCopy() {
         Task deepCopy = copy();
@@ -955,11 +1065,11 @@ public class Task {
                 && Objects.equals(getInputMessage(), task.getInputMessage())
                 && Objects.equals(getOutputMessage(), task.getOutputMessage())
                 && Objects.equals(
-                        getExternalInputPayloadStoragePath(),
-                        task.getExternalInputPayloadStoragePath())
+                getExternalInputPayloadStoragePath(),
+                task.getExternalInputPayloadStoragePath())
                 && Objects.equals(
-                        getExternalOutputPayloadStoragePath(),
-                        task.getExternalOutputPayloadStoragePath())
+                getExternalOutputPayloadStoragePath(),
+                task.getExternalOutputPayloadStoragePath())
                 && Objects.equals(getIsolationGroupId(), task.getIsolationGroupId())
                 && Objects.equals(getExecutionNameSpace(), task.getExecutionNameSpace());
     }

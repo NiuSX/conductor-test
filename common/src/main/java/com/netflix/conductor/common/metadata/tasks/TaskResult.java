@@ -28,53 +28,94 @@ import com.netflix.conductor.annotations.protogen.ProtoMessage;
 import com.google.protobuf.Any;
 import io.swagger.v3.oas.annotations.Hidden;
 
-/** Result of the task execution. */
+/**
+ * 任务执行结果（TaskResult）模型类。
+ *
+ * <p>表示 worker 执行完任务后向 Conductor 汇报的结果，用于驱动任务状态的流转。
+ * 它是 worker 与 Conductor 服务端交互的核心数据对象，通常由 worker 通过
+ * {@code /tasks/{taskId}/ack} 或 {@code /tasks/{taskId}/update} 等接口提交。
+ *
+ * <p>通过 {@link ProtoMessage} 和 {@link ProtoField} 注解支持 Protobuf 序列化。
+ */
 @ProtoMessage
 public class TaskResult {
 
+    /**
+     * 任务结果状态枚举。
+     *
+     * <p>相比 {@link Task.Status}，这里的取值更精简，只保留 worker 需要汇报的几种状态。
+     */
     @ProtoEnum
     public enum Status {
+        /** 任务仍在进行中（适用于长时间运行的任务） */
         IN_PROGRESS,
+        /** 任务失败，可重试 */
         FAILED,
+        /** 任务因终端错误失败，不再重试 */
         FAILED_WITH_TERMINAL_ERROR,
+        /** 任务成功完成 */
         COMPLETED
     }
 
+    /** 工作流实例 ID，不能为空 */
     @NotEmpty(message = "Workflow Id cannot be null or empty")
     @ProtoField(id = 1)
     private String workflowInstanceId;
 
+    /** 任务 ID，不能为空 */
     @NotEmpty(message = "Task ID cannot be null or empty")
     @ProtoField(id = 2)
     private String taskId;
 
+    /** 任务未完成的原因 */
     @ProtoField(id = 3)
     private String reasonForIncompletion;
 
+    /** 回调延迟时间（秒），用于延迟队列实现 */
     @ProtoField(id = 4)
     private long callbackAfterSeconds;
 
+    /** 执行该任务的 worker ID */
     @ProtoField(id = 5)
     private String workerId;
 
+    /** 任务结果状态 */
     @ProtoField(id = 6)
     private Status status;
 
+    /** 任务输出数据 */
     @ProtoField(id = 7)
     private Map<String, Object> outputData = new HashMap<>();
 
+    /** 输出消息（Protobuf Any 类型），不对外暴露 */
     @ProtoField(id = 8)
     @Hidden
     private Any outputMessage;
 
+    /** 任务执行日志列表，使用 CopyOnWriteArrayList 保证并发安全 */
     private List<TaskExecLog> logs = new CopyOnWriteArrayList<>();
 
+    /** 任务输出负载的外部存储路径 */
     private String externalOutputPayloadStoragePath;
 
+    /** 子工作流 ID */
     private String subWorkflowId;
 
+    /** 是否延长任务租约 */
     private boolean extendLease;
 
+    /**
+     * 从 {@link Task} 构造 {@link TaskResult}，将任务状态映射为结果状态。
+     *
+     * <p>状态映射规则：
+     * <ul>
+     *   <li>CANCELED、COMPLETED_WITH_ERRORS、TIMED_OUT、SKIPPED → {@link Status#FAILED}</li>
+     *   <li>SCHEDULED → {@link Status#IN_PROGRESS}</li>
+     *   <li>其他状态按名称直接映射</li>
+     * </ul>
+     *
+     * @param task 任务实例
+     */
     public TaskResult(Task task) {
         this.workflowInstanceId = task.getWorkflowInstanceId();
         this.taskId = task.getTaskId();
@@ -103,7 +144,7 @@ public class TaskResult {
     public TaskResult() {}
 
     /**
-     * @return Workflow instance id for which the task result is produced
+     * @return 产生该任务结果的工作流实例 ID
      */
     public String getWorkflowInstanceId() {
         return workflowInstanceId;
@@ -125,6 +166,11 @@ public class TaskResult {
         return reasonForIncompletion;
     }
 
+    /**
+     * 设置任务未完成原因，最长保留 500 个字符。
+     *
+     * @param reasonForIncompletion 未完成原因
+     */
     public void setReasonForIncompletion(String reasonForIncompletion) {
         this.reasonForIncompletion = StringUtils.substring(reasonForIncompletion, 0, 500);
     }
@@ -134,13 +180,13 @@ public class TaskResult {
     }
 
     /**
-     * When set to non-zero values, the task remains in the queue for the specified seconds before
-     * sent back to the worker when polled. Useful for the long running task, where the task is
-     * updated as IN_PROGRESS and should not be polled out of the queue for a specified amount of
-     * time. (delayed queue implementation)
+     * 设置回调延迟时间。
      *
-     * @param callbackAfterSeconds Amount of time in seconds the task should be held in the queue
-     *     before giving it to a polling worker.
+     * <p>当设置为非零值时，任务会在队列中保留指定秒数后才被 worker 轮询到，
+     * 适用于长时间运行的任务：任务被更新为 IN_PROGRESS 后，在指定时间内不应被
+     * 重新从队列中取出（延迟队列实现）。
+     *
+     * @param callbackAfterSeconds 任务在被交给轮询 worker 之前应在队列中保留的秒数
      */
     public void setCallbackAfterSeconds(long callbackAfterSeconds) {
         this.callbackAfterSeconds = callbackAfterSeconds;
@@ -151,28 +197,30 @@ public class TaskResult {
     }
 
     /**
-     * @param workerId a free form string identifying the worker host. Could be hostname, IP Address
-     *     or any other meaningful identifier that can help identify the host/process which executed
-     *     the task, in case of troubleshooting.
+     * @param workerId 用于标识 worker 主机的自由格式字符串。可以是主机名、IP 地址或
+     *     任何有意义的标识符，用于在排查问题时识别执行该任务的主机/进程。
      */
     public void setWorkerId(String workerId) {
         this.workerId = workerId;
     }
 
     /**
-     * @return the status
+     * @return 任务结果状态
      */
     public Status getStatus() {
         return status;
     }
 
     /**
-     * @param status Status of the task
-     *     <p><b>IN_PROGRESS</b>: Use this for long running tasks, indicating the task is still in
-     *     progress and should be checked again at a later time. e.g. the worker checks the status
-     *     of the job in the DB, while the job is being executed by another process.
-     *     <p><b>FAILED, FAILED_WITH_TERMINAL_ERROR, COMPLETED</b>: Terminal statuses for the task.
-     *     Use FAILED_WITH_TERMINAL_ERROR when you do not want the task to be retried.
+     * 设置任务结果状态。
+     *
+     * <p><b>IN_PROGRESS</b>：用于长时间运行的任务，表示任务仍在进行中，稍后需要再次检查。
+     * 例如 worker 检查 DB 中的作业状态，而作业正由另一个进程执行。
+     *
+     * <p><b>FAILED、FAILED_WITH_TERMINAL_ERROR、COMPLETED</b>：任务的终态。
+     * 当不希望任务被重试时，使用 FAILED_WITH_TERMINAL_ERROR。
+     *
+     * @param status 任务状态
      * @see #setCallbackAfterSeconds(long)
      */
     public void setStatus(Status status) {
@@ -184,18 +232,18 @@ public class TaskResult {
     }
 
     /**
-     * @param outputData output data to be set for the task execution result
+     * @param outputData 任务执行结果的输出数据
      */
     public void setOutputData(Map<String, Object> outputData) {
         this.outputData = outputData;
     }
 
     /**
-     * Adds output
+     * 添加一条输出数据。
      *
-     * @param key output field
-     * @param value value
-     * @return current instance
+     * @param key 输出字段名
+     * @param value 输出值
+     * @return 当前 TaskResult 实例，便于链式调用
      */
     public TaskResult addOutputData(String key, Object value) {
         this.outputData.put(key, value);
@@ -211,22 +259,24 @@ public class TaskResult {
     }
 
     /**
-     * @return Task execution logs
+     * @return 任务执行日志列表
      */
     public List<TaskExecLog> getLogs() {
         return logs;
     }
 
     /**
-     * @param logs Task execution logs
+     * @param logs 任务执行日志列表
      */
     public void setLogs(List<TaskExecLog> logs) {
         this.logs = logs;
     }
 
     /**
-     * @param log Log line to be added
-     * @return Instance of TaskResult
+     * 追加一条任务执行日志。
+     *
+     * @param log 要添加的日志行
+     * @return 当前 TaskResult 实例，便于链式调用
      */
     public TaskResult log(String log) {
         this.logs.add(new TaskExecLog(log));
@@ -234,15 +284,14 @@ public class TaskResult {
     }
 
     /**
-     * @return the path where the task output is stored in external storage
+     * @return 任务输出在外部存储中的路径
      */
     public String getExternalOutputPayloadStoragePath() {
         return externalOutputPayloadStoragePath;
     }
 
     /**
-     * @param externalOutputPayloadStoragePath path in the external storage where the task output is
-     *     stored
+     * @param externalOutputPayloadStoragePath 任务输出在外部存储中的路径
      */
     public void setExternalOutputPayloadStoragePath(String externalOutputPayloadStoragePath) {
         this.externalOutputPayloadStoragePath = externalOutputPayloadStoragePath;
@@ -301,24 +350,39 @@ public class TaskResult {
                 + '}';
     }
 
+    /** 创建一个表示"任务成功完成"的结果对象 */
     public static TaskResult complete() {
         return newTaskResult(Status.COMPLETED);
     }
 
+    /** 创建一个表示"任务失败"的结果对象 */
     public static TaskResult failed() {
         return newTaskResult(Status.FAILED);
     }
 
+    /**
+     * 创建一个表示"任务失败"的结果对象，并附带失败原因。
+     *
+     * @param failureReason 失败原因
+     * @return 任务结果对象
+     */
     public static TaskResult failed(String failureReason) {
         TaskResult result = newTaskResult(Status.FAILED);
         result.setReasonForIncompletion(failureReason);
         return result;
     }
 
+    /** 创建一个表示"任务进行中"的结果对象 */
     public static TaskResult inProgress() {
         return newTaskResult(Status.IN_PROGRESS);
     }
 
+    /**
+     * 根据给定状态创建任务结果对象。
+     *
+     * @param status 任务结果状态
+     * @return 任务结果对象
+     */
     public static TaskResult newTaskResult(Status status) {
         TaskResult result = new TaskResult();
         result.setStatus(status);

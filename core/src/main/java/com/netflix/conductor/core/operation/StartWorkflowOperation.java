@@ -36,6 +36,20 @@ import com.netflix.conductor.metrics.Monitors;
 import com.netflix.conductor.model.WorkflowModel;
 import com.netflix.conductor.service.ExecutionLockService;
 
+/**
+ * 启动工作流操作：把"启动工作流的请求"转化为一个持久化的工作流实例。
+ *
+ * 它是 WorkflowOperation 模式的一个实现，封装了启动工作流的完整流程：
+ * 1. 解析工作流定义（从请求或 MetadataService）
+ * 2. 填充任务定义
+ * 3. 校验输入
+ * 4. 生成 workflowId、构造 WorkflowModel
+ * 5. 加锁、持久化、发布评估事件（触发首次 decide）
+ *
+ * 为什么单独抽成一个 Operation 类？
+ * - 启动逻辑较复杂，抽出来让 WorkflowServiceImpl 保持薄封装
+ * - 可以被多种入口复用：直接调用 execute()，或监听 WorkflowCreationEvent 事件
+ */
 @Component
 public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowInput, String> {
 
@@ -63,39 +77,66 @@ public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowIn
         this.eventPublisher = eventPublisher;
     }
 
+    /**
+     * 执行入口：WorkflowService 通过它启动工作流。
+     *
+     * @param input 启动工作流的输入
+     * @return 工作流实例 id
+     */
     @Override
     public String execute(StartWorkflowInput input) {
         return startWorkflow(input);
     }
 
+    /**
+     * 监听 WorkflowCreationEvent 事件，异步启动工作流。
+     * 用于"失败工作流"等由事件触发的启动场景。
+     */
     @EventListener(WorkflowCreationEvent.class)
     public void handleWorkflowCreationEvent(WorkflowCreationEvent workflowCreationEvent) {
         startWorkflow(workflowCreationEvent.getStartWorkflowInput());
     }
 
+    /**
+     * 启动工作流的核心实现。
+     *
+     * 流程：
+     * 1. 解析定义（请求内联 or 从 MetadataService 查）
+     * 2. 填充任务定义（TaskDef、子工作流版本）
+     * 3. 校验输入
+     * 4. 生成 workflowId、构造 WorkflowModel
+     * 5. 加锁 → 持久化 → 发布评估事件
+     *
+     * @param input 启动输入
+     * @return 工作流实例 id
+     */
     private String startWorkflow(StartWorkflowInput input) {
         WorkflowDef workflowDefinition;
 
+        // 1. 解析工作流定义
         if (input.getWorkflowDefinition() == null) {
+            // 请求没带定义：从 MetadataService 查（按 name + version）
             workflowDefinition =
                     metadataMapperService.lookupForWorkflowDefinition(
                             input.getName(), input.getVersion());
         } else {
+            // 请求内联了定义：直接用
             workflowDefinition = input.getWorkflowDefinition();
         }
 
+        // 2. 填充任务定义（TaskDef、子工作流版本等）
         workflowDefinition = metadataMapperService.populateTaskDefinitions(workflowDefinition);
 
-        // perform validations
+        // 3. 校验输入
         Map<String, Object> workflowInput = input.getWorkflowInput();
         String externalInputPayloadStoragePath = input.getExternalInputPayloadStoragePath();
         validateWorkflow(workflowDefinition, workflowInput, externalInputPayloadStoragePath);
 
-        // Generate ID if it's not present
+        // 4. 生成 workflowId（若请求已指定则复用）
         String workflowId =
                 Optional.ofNullable(input.getWorkflowId()).orElseGet(idGenerator::generate);
 
-        // Persist the Workflow
+        // 5. 构造 WorkflowModel
         WorkflowModel workflow = new WorkflowModel();
         workflow.setWorkflowId(workflowId);
         workflow.setCorrelationId(input.getCorrelationId());
@@ -104,14 +145,17 @@ public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowIn
         workflow.setStatus(WorkflowModel.Status.RUNNING);
         workflow.setParentWorkflowId(input.getParentWorkflowId());
         workflow.setParentWorkflowTaskId(input.getParentWorkflowTaskId());
+        // 记录发起方（从线程上下文获取）
         workflow.setOwnerApp(WorkflowContext.get().getClientApp());
         workflow.setCreateTime(System.currentTimeMillis());
         workflow.setUpdatedBy(null);
         workflow.setUpdatedTime(null);
         workflow.setEvent(input.getEvent());
         workflow.setTaskToDomain(input.getTaskToDomain());
+        // 从定义里带出初始变量
         workflow.setVariables(workflowDefinition.getVariables());
 
+        // 设置输入：内联输入则解析，否则记录外部存储路径
         if (workflowInput != null && !workflowInput.isEmpty()) {
             Map<String, Object> parsedInput =
                     parametersUtils.getWorkflowInput(workflowDefinition, workflowInput);
@@ -121,6 +165,7 @@ public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowIn
         }
 
         try {
+            // 6. 加锁持久化 + 发布评估事件
             createAndEvaluate(workflow);
             Monitors.recordWorkflowStartSuccess(
                     workflow.getWorkflowName(),
@@ -132,8 +177,7 @@ public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowIn
                     workflowDefinition.getName(), WorkflowContext.get().getClientApp());
             LOGGER.error("Unable to start workflow: {}", workflowDefinition.getName(), e);
 
-            // It's possible the remove workflow call hits an exception as well, in that case we
-            // want to log both errors to help diagnosis.
+            // 启动失败：尝试清理已创建的工作流（可能只创建了一半）
             try {
                 executionDAOFacade.removeWorkflow(workflowId, false);
             } catch (Exception rwe) {
@@ -144,20 +188,23 @@ public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowIn
     }
 
     /*
-     * Acquire and hold the lock till the workflow creation action is completed (in primary and secondary datastores).
-     * This is to ensure that workflow creation action precedes any other action on a given workflow.
+     * 获取并持有锁，直到工作流创建动作完成（主存储和二级存储都写完）。
+     * 这是为了确保"工作流创建"动作先于对该工作流的任何其他动作。
      */
     private void createAndEvaluate(WorkflowModel workflow) {
         if (!executionLockService.acquireLock(workflow.getWorkflowId())) {
             throw new TransientException("Error acquiring lock when creating workflow: {}");
         }
         try {
+            // 持久化工作流到数据库
             executionDAOFacade.createWorkflow(workflow);
             LOGGER.debug(
                     "A new instance of workflow: {} created with id: {}",
                     workflow.getWorkflowName(),
                     workflow.getWorkflowId());
+            // 填充工作流和任务的 payload 数据（如从外部存储加载）
             executionDAOFacade.populateWorkflowAndTaskPayloadData(workflow);
+            // 发布评估事件，触发首次 decide（异步推进工作流）
             eventPublisher.publishEvent(new WorkflowEvaluationEvent(workflow));
         } finally {
             executionLockService.releaseLock(workflow.getWorkflowId());
@@ -165,15 +212,15 @@ public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowIn
     }
 
     /**
-     * Performs validations for starting a workflow
+     * 启动工作流的校验。
      *
-     * @throws IllegalArgumentException if the validation fails.
+     * @throws IllegalArgumentException 校验失败
      */
     private void validateWorkflow(
             WorkflowDef workflowDef,
             Map<String, Object> workflowInput,
             String externalStoragePath) {
-        // Check if the input to the workflow is not null
+        // 输入不能为 null：要么有内联输入，要么有外部存储路径
         if (workflowInput == null && StringUtils.isBlank(externalStoragePath)) {
             LOGGER.error("The input for the workflow '{}' cannot be NULL", workflowDef.getName());
             Monitors.recordWorkflowStartError(

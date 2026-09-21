@@ -31,58 +31,95 @@ import com.netflix.conductor.common.constraints.OwnerEmailMandatoryConstraint;
 import com.netflix.conductor.common.constraints.TaskTimeoutConstraint;
 import com.netflix.conductor.common.metadata.BaseDef;
 
+/**
+ * 任务定义（TaskDef）元数据类。
+ *
+ * <p>描述“某一类任务”应该如何被调度和执行，是任务实例（{@link Task}）的模板。
+ * 包含任务的超时策略、重试策略、限流、并发限制、输入输出键等配置。
+ *
+ * <p>通过 {@link ProtoMessage} 和 {@link ProtoField} 注解支持 Protobuf 序列化；
+ * 同时使用 JSR-303 校验注解进行参数校验。
+ *
+ * <p>类级别注解：
+ * <ul>
+ *   <li>{@link TaskTimeoutConstraint}：自定义校验，确保 timeoutSeconds 与 responseTimeoutSeconds 的关系合法</li>
+ *   <li>{@link Valid}：开启级联校验</li>
+ * </ul>
+ */
 @ProtoMessage
 @TaskTimeoutConstraint
 @Valid
 public class TaskDef extends BaseDef {
 
+    /**
+     * 任务超时策略枚举。
+     */
     @ProtoEnum
     public enum TimeoutPolicy {
+        /** 超时后重试任务 */
         RETRY,
+        /** 超时后终止整个工作流 */
         TIME_OUT_WF,
+        /** 仅告警，不做其他处理 */
         ALERT_ONLY
     }
 
+    /**
+     * 重试逻辑枚举，决定重试间隔如何计算。
+     */
     @ProtoEnum
     public enum RetryLogic {
+        /** 固定间隔重试 */
         FIXED,
+        /** 指数退避重试 */
         EXPONENTIAL_BACKOFF,
+        /** 线性退避重试 */
         LINEAR_BACKOFF
     }
 
+    /** 一小时的秒数常量 */
     public static final int ONE_HOUR = 60 * 60;
 
-    /** Unique name identifying the task. The name is unique across */
+    /** 任务唯一名称，全局唯一 */
     @NotEmpty(message = "TaskDef name cannot be null or empty")
     @ProtoField(id = 1)
     private String name;
 
+    /** 任务描述 */
     @ProtoField(id = 2)
     private String description;
 
+    /** 重试次数，默认 3 次，必须 >= 0 */
     @ProtoField(id = 3)
     @Min(value = 0, message = "TaskDef retryCount: {value} must be >= 0")
-    private int retryCount = 3; // Default
+    private int retryCount = 3; // 默认值
 
+    /** 任务超时时间（秒），必须非空 */
     @ProtoField(id = 4)
     @NotNull
     private long timeoutSeconds;
 
+    /** 任务输入参数键列表 */
     @ProtoField(id = 5)
     private List<String> inputKeys = new ArrayList<>();
 
+    /** 任务输出参数键列表 */
     @ProtoField(id = 6)
     private List<String> outputKeys = new ArrayList<>();
 
+    /** 超时策略，默认超时后终止工作流 */
     @ProtoField(id = 7)
     private TimeoutPolicy timeoutPolicy = TimeoutPolicy.TIME_OUT_WF;
 
+    /** 重试逻辑，默认固定间隔 */
     @ProtoField(id = 8)
     private RetryLogic retryLogic = RetryLogic.FIXED;
 
+    /** 重试延迟时间（秒），默认 60 秒 */
     @ProtoField(id = 9)
     private int retryDelaySeconds = 60;
 
+    /** 响应超时时间（秒），最小 1 秒，默认 1 小时 */
     @ProtoField(id = 10)
     @Min(
             value = 1,
@@ -90,37 +127,46 @@ public class TaskDef extends BaseDef {
                     "TaskDef responseTimeoutSeconds: ${validatedValue} should be minimum {value} second")
     private long responseTimeoutSeconds = ONE_HOUR;
 
+    /** 并发执行限制，同一时间允许处于 IN_PROGRESS 状态的最大任务数 */
     @ProtoField(id = 11)
     private Integer concurrentExecLimit;
 
+    /** 输入模板，用于在运行时生成任务输入 */
     @ProtoField(id = 12)
     private Map<String, Object> inputTemplate = new HashMap<>();
 
-    // This field is deprecated, do not use id 13.
+    // 该字段已废弃，请勿使用 id 13。
     //	@ProtoField(id = 13)
     //	private Integer rateLimitPerSecond;
 
+    /** 每个限流频率周期内允许执行的最大任务数 */
     @ProtoField(id = 14)
     private Integer rateLimitPerFrequency;
 
+    /** 限流频率周期（秒） */
     @ProtoField(id = 15)
     private Integer rateLimitFrequencyInSeconds;
 
+    /** 隔离组 ID */
     @ProtoField(id = 16)
     private String isolationGroupId;
 
+    /** 执行命名空间 */
     @ProtoField(id = 17)
     private String executionNameSpace;
 
+    /** 任务负责人邮箱，必须为合法邮箱地址 */
     @ProtoField(id = 18)
     @OwnerEmailMandatoryConstraint
     @Email(message = "ownerEmail should be valid email address")
     private String ownerEmail;
 
+    /** 轮询超时时间（秒），必须 >= 0 */
     @ProtoField(id = 19)
     @Min(value = 0, message = "TaskDef pollTimeoutSeconds: {value} must be >= 0")
     private Integer pollTimeoutSeconds;
 
+    /** 退避比例因子，适用于 LINEAR_BACKOFF，最小为 1 */
     @ProtoField(id = 20)
     @Min(value = 1, message = "Backoff scale factor. Applicable for LINEAR_BACKOFF")
     private Integer backoffScaleFactor = 1;
@@ -159,210 +205,203 @@ public class TaskDef extends BaseDef {
     }
 
     /**
-     * @return the name
+     * @return 任务名称
      */
     public String getName() {
         return name;
     }
 
     /**
-     * @param name the name to set
+     * @param name 任务名称
      */
     public void setName(String name) {
         this.name = name;
     }
 
     /**
-     * @return the description
+     * @return 任务描述
      */
     public String getDescription() {
         return description;
     }
 
     /**
-     * @param description the description to set
+     * @param description 任务描述
      */
     public void setDescription(String description) {
         this.description = description;
     }
 
     /**
-     * @return the retryCount
+     * @return 重试次数
      */
     public int getRetryCount() {
         return retryCount;
     }
 
     /**
-     * @param retryCount the retryCount to set
+     * @param retryCount 重试次数
      */
     public void setRetryCount(int retryCount) {
         this.retryCount = retryCount;
     }
 
     /**
-     * @return the timeoutSeconds
+     * @return 超时时间（秒）
      */
     public long getTimeoutSeconds() {
         return timeoutSeconds;
     }
 
     /**
-     * @param timeoutSeconds the timeoutSeconds to set
+     * @param timeoutSeconds 超时时间（秒）
      */
     public void setTimeoutSeconds(long timeoutSeconds) {
         this.timeoutSeconds = timeoutSeconds;
     }
 
     /**
-     * @return Returns the input keys
+     * @return 输入键列表
      */
     public List<String> getInputKeys() {
         return inputKeys;
     }
 
     /**
-     * @param inputKeys Set of keys that the task accepts in the input map
+     * @param inputKeys 任务输入 map 中允许接受的键集合
      */
     public void setInputKeys(List<String> inputKeys) {
         this.inputKeys = inputKeys;
     }
 
     /**
-     * @return Returns the output keys for the task when executed
+     * @return 任务执行完成后的输出键列表
      */
     public List<String> getOutputKeys() {
         return outputKeys;
     }
 
     /**
-     * @param outputKeys Sets the output keys
+     * @param outputKeys 输出键列表
      */
     public void setOutputKeys(List<String> outputKeys) {
         this.outputKeys = outputKeys;
     }
 
     /**
-     * @return the timeoutPolicy
+     * @return 超时策略
      */
     public TimeoutPolicy getTimeoutPolicy() {
         return timeoutPolicy;
     }
 
     /**
-     * @param timeoutPolicy the timeoutPolicy to set
+     * @param timeoutPolicy 超时策略
      */
     public void setTimeoutPolicy(TimeoutPolicy timeoutPolicy) {
         this.timeoutPolicy = timeoutPolicy;
     }
 
     /**
-     * @return the retryLogic
+     * @return 重试逻辑
      */
     public RetryLogic getRetryLogic() {
         return retryLogic;
     }
 
     /**
-     * @param retryLogic the retryLogic to set
+     * @param retryLogic 重试逻辑
      */
     public void setRetryLogic(RetryLogic retryLogic) {
         this.retryLogic = retryLogic;
     }
 
     /**
-     * @return the retryDelaySeconds
+     * @return 重试延迟时间（秒）
      */
     public int getRetryDelaySeconds() {
         return retryDelaySeconds;
     }
 
     /**
-     * @return the timeout for task to send response. After this timeout, the task will be re-queued
+     * @return 任务响应超时时间（秒），超过该时间任务会被重新入队
      */
     public long getResponseTimeoutSeconds() {
         return responseTimeoutSeconds;
     }
 
     /**
-     * @param responseTimeoutSeconds - timeout for task to send response. After this timeout, the
-     *     task will be re-queued
+     * @param responseTimeoutSeconds 任务响应超时时间（秒），超过该时间任务会被重新入队
      */
     public void setResponseTimeoutSeconds(long responseTimeoutSeconds) {
         this.responseTimeoutSeconds = responseTimeoutSeconds;
     }
 
     /**
-     * @param retryDelaySeconds the retryDelaySeconds to set
+     * @param retryDelaySeconds 重试延迟时间（秒）
      */
     public void setRetryDelaySeconds(int retryDelaySeconds) {
         this.retryDelaySeconds = retryDelaySeconds;
     }
 
     /**
-     * @return the inputTemplate
+     * @return 输入模板
      */
     public Map<String, Object> getInputTemplate() {
         return inputTemplate;
     }
 
     /**
-     * @return rateLimitPerFrequency The max number of tasks that will be allowed to be executed per
-     *     rateLimitFrequencyInSeconds.
+     * @return 每个限流周期内允许执行的最大任务数；未设置时返回 0
      */
     public Integer getRateLimitPerFrequency() {
         return rateLimitPerFrequency == null ? 0 : rateLimitPerFrequency;
     }
 
     /**
-     * @param rateLimitPerFrequency The max number of tasks that will be allowed to be executed per
-     *     rateLimitFrequencyInSeconds. Setting the value to 0 removes the rate limit
+     * @param rateLimitPerFrequency 每个限流周期内允许执行的最大任务数；设置为 0 表示移除限流
      */
     public void setRateLimitPerFrequency(Integer rateLimitPerFrequency) {
         this.rateLimitPerFrequency = rateLimitPerFrequency;
     }
 
     /**
-     * @return rateLimitFrequencyInSeconds: The time bucket that is used to rate limit tasks based
-     *     on {@link #getRateLimitPerFrequency()} If null or not set, then defaults to 1 second
+     * @return 限流时间窗口（秒）；未设置时默认返回 1 秒
      */
     public Integer getRateLimitFrequencyInSeconds() {
         return rateLimitFrequencyInSeconds == null ? 1 : rateLimitFrequencyInSeconds;
     }
 
     /**
-     * @param rateLimitFrequencyInSeconds: The time window/bucket for which the rate limit needs to
-     *     be applied. This will only have affect if {@link #getRateLimitPerFrequency()} is greater
-     *     than zero
+     * @param rateLimitFrequencyInSeconds 限流时间窗口（秒）；仅当 rateLimitPerFrequency 大于 0 时生效
      */
     public void setRateLimitFrequencyInSeconds(Integer rateLimitFrequencyInSeconds) {
         this.rateLimitFrequencyInSeconds = rateLimitFrequencyInSeconds;
     }
 
     /**
-     * @param concurrentExecLimit Limit of number of concurrent task that can be IN_PROGRESS at a
-     *     given time. Seting the value to 0 removes the limit.
+     * @param concurrentExecLimit 允许同时处于 IN_PROGRESS 状态的最大任务数；设置为 0 表示移除限制
      */
     public void setConcurrentExecLimit(Integer concurrentExecLimit) {
         this.concurrentExecLimit = concurrentExecLimit;
     }
 
     /**
-     * @return Limit of number of concurrent task that can be IN_PROGRESS at a given time
+     * @return 允许同时处于 IN_PROGRESS 状态的最大任务数
      */
     public Integer getConcurrentExecLimit() {
         return concurrentExecLimit;
     }
 
     /**
-     * @return concurrency limit
+     * @return 并发限制，未设置时返回 0（表示无限制）
      */
     public int concurrencyLimit() {
         return concurrentExecLimit == null ? 0 : concurrentExecLimit;
     }
 
     /**
-     * @param inputTemplate the inputTemplate to set
+     * @param inputTemplate 输入模板
      */
     public void setInputTemplate(Map<String, Object> inputTemplate) {
         this.inputTemplate = inputTemplate;
@@ -385,42 +424,42 @@ public class TaskDef extends BaseDef {
     }
 
     /**
-     * @return the email of the owner of this task definition
+     * @return 任务定义负责人的邮箱
      */
     public String getOwnerEmail() {
         return ownerEmail;
     }
 
     /**
-     * @param ownerEmail the owner email to set
+     * @param ownerEmail 任务定义负责人的邮箱
      */
     public void setOwnerEmail(String ownerEmail) {
         this.ownerEmail = ownerEmail;
     }
 
     /**
-     * @param pollTimeoutSeconds the poll timeout to set
+     * @param pollTimeoutSeconds 轮询超时时间
      */
     public void setPollTimeoutSeconds(Integer pollTimeoutSeconds) {
         this.pollTimeoutSeconds = pollTimeoutSeconds;
     }
 
     /**
-     * @return the poll timeout of this task definition
+     * @return 任务定义的轮询超时时间
      */
     public Integer getPollTimeoutSeconds() {
         return pollTimeoutSeconds;
     }
 
     /**
-     * @param backoffScaleFactor the backoff rate to set
+     * @param backoffScaleFactor 退避比例因子
      */
     public void setBackoffScaleFactor(Integer backoffScaleFactor) {
         this.backoffScaleFactor = backoffScaleFactor;
     }
 
     /**
-     * @return the backoff rate of this task definition
+     * @return 任务定义的退避比例因子
      */
     public Integer getBackoffScaleFactor() {
         return backoffScaleFactor;

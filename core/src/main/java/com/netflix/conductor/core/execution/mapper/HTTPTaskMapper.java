@@ -30,9 +30,12 @@ import com.netflix.conductor.model.TaskModel;
 import com.netflix.conductor.model.WorkflowModel;
 
 /**
- * An implementation of {@link TaskMapper} to map a {@link WorkflowTask} of type {@link
- * TaskType#HTTP} to a {@link TaskModel} of type {@link TaskType#HTTP} with {@link
- * TaskModel.Status#SCHEDULED}
+ * HTTPTaskMapper：{@link TaskMapper} 的实现，把 {@link TaskType#HTTP} 类型的
+ * {@link WorkflowTask} 映射为状态为 {@link TaskModel.Status#SCHEDULED} 的
+ * {@link TaskModel}。
+ *
+ * 它的职责很简单：构造一个 SCHEDULED 状态的 HTTP 任务实例，交给引擎调度。
+ * 真正的 HTTP 调用发生在运行时（由 HttpTask 系统任务执行）。
  */
 @Component
 public class HTTPTaskMapper implements TaskMapper {
@@ -48,19 +51,25 @@ public class HTTPTaskMapper implements TaskMapper {
         this.metadataDAO = metadataDAO;
     }
 
+    /** 返回本 mapper 处理的任务类型：HTTP */
     @Override
     public String getTaskType() {
         return TaskType.HTTP.name();
     }
 
     /**
-     * This method maps a {@link WorkflowTask} of type {@link TaskType#HTTP} to a {@link TaskModel}
-     * in a {@link TaskModel.Status#SCHEDULED} state
+     * 把 HTTP 类型的 {@link WorkflowTask} 映射为 SCHEDULED 状态的 {@link TaskModel}。
      *
-     * @param taskMapperContext: A wrapper class containing the {@link WorkflowTask}, {@link
-     *     WorkflowDef}, {@link WorkflowModel} and a string representation of the TaskId
-     * @return a List with just one HTTP task
-     * @throws TerminateWorkflowException In case if the task definition does not exist
+     * 流程：
+     * 1. 读取 WorkflowTask 和上下文信息
+     * 2. 查找 TaskDef（优先用上下文里的，否则查库）
+     * 3. 用 ParametersUtils 解析输入参数（支持表达式）
+     * 4. 创建 TaskModel，设置输入、状态、重试、延迟、限流等属性
+     *
+     * @param taskMapperContext 映射上下文，含 WorkflowTask、WorkflowDef、
+     *                          WorkflowModel 和 taskId
+     * @return 只含一个 HTTP 任务的列表
+     * @throws TerminateWorkflowException 任务定义不存在时抛出
      */
     @Override
     public List<TaskModel> getMappedTasks(TaskMapperContext taskMapperContext)
@@ -69,26 +78,32 @@ public class HTTPTaskMapper implements TaskMapper {
         LOGGER.debug("TaskMapperContext {} in HTTPTaskMapper", taskMapperContext);
 
         WorkflowTask workflowTask = taskMapperContext.getWorkflowTask();
+        // 把 asyncComplete 标记放入输入参数，供运行时判断是否异步完成
         workflowTask.getInputParameters().put("asyncComplete", workflowTask.isAsyncComplete());
         WorkflowModel workflowModel = taskMapperContext.getWorkflowModel();
         String taskId = taskMapperContext.getTaskId();
         int retryCount = taskMapperContext.getRetryCount();
 
+        // 优先用上下文里的 TaskDef，否则查库
         TaskDef taskDefinition =
                 Optional.ofNullable(taskMapperContext.getTaskDefinition())
                         .orElseGet(() -> metadataDAO.getTaskDef(workflowTask.getName()));
 
+        // 解析输入参数（支持 ${...} 表达式，从工作流上下文求值）
         Map<String, Object> input =
                 parametersUtils.getTaskInputV2(
                         workflowTask.getInputParameters(), workflowModel, taskId, taskDefinition);
         Boolean asynComplete = (Boolean) input.get("asyncComplete");
 
+        // 创建任务实例
         TaskModel httpTask = taskMapperContext.createTaskModel();
         httpTask.setInputData(input);
         httpTask.getInputData().put("asyncComplete", asynComplete);
         httpTask.setStatus(TaskModel.Status.SCHEDULED);
         httpTask.setRetryCount(retryCount);
+        // 启动延迟（来自 WorkflowTask 的 startDelay）
         httpTask.setCallbackAfterSeconds(workflowTask.getStartDelay());
+        // 若有限流/隔离配置，一并设置
         if (Objects.nonNull(taskDefinition)) {
             httpTask.setRateLimitPerFrequency(taskDefinition.getRateLimitPerFrequency());
             httpTask.setRateLimitFrequencyInSeconds(
