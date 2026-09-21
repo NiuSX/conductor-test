@@ -30,13 +30,13 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 
 /**
- * JsonProtoModule can be registered into an {@link ObjectMapper} to enable the serialization and
- * deserialization of ProtoBuf objects from/to JSON.
+ * JsonProtoModule：可注册到 {@link ObjectMapper} 的 Jackson 模块，
+ * 用于实现 ProtoBuf 对象与 JSON 之间的序列化/反序列化。
  *
- * <p>Right now this module only provides (de)serialization for the {@link Any} ProtoBuf type, as
- * this is the only ProtoBuf object which we're currently exposing through the REST API.
+ * 目前只支持 {@link Any} 这一种 ProtoBuf 类型，因为它是 Conductor 目前
+ * 通过 REST API 唯一暴露的 ProtoBuf 对象。
  *
- * <p>Annotated as {@link Component} so Spring can register it with {@link ObjectMapper}
+ * 标注为 {@link Component}，让 Spring 自动把它注册到 ObjectMapper。
  *
  * @see AnySerializer
  * @see AnyDeserializer
@@ -45,92 +45,115 @@ import com.google.protobuf.Message;
 @Component(JsonProtoModule.NAME)
 public class JsonProtoModule extends SimpleModule {
 
+    /** 模块名（作为 Spring Bean 名） */
     public static final String NAME = "ConductorJsonProtoModule";
 
+    /** JSON 中表示类型 URL 的字段名 */
     private static final String JSON_TYPE = "@type";
+    /** JSON 中表示二进制数据的字段名 */
     private static final String JSON_VALUE = "@value";
 
     /**
-     * AnySerializer converts a ProtoBuf {@link Any} object into its JSON representation.
+     * AnySerializer：把 ProtoBuf 的 {@link Any} 对象序列化为 JSON。
      *
-     * <p>This is <b>not</b> a canonical ProtoBuf JSON representation. Let us explain what we're
-     * trying to accomplish here:
+     * <p>这<b>不是</b> ProtoBuf 的规范 JSON 表示。说明一下我们要解决的问题：
      *
-     * <p>The {@link Any} ProtoBuf message is a type in the PB standard library that can store any
-     * other arbitrary ProtoBuf message in a type-safe way, even when the server has no knowledge of
-     * the schema of the stored message.
+     * <p>{@link Any} 是 ProtoBuf 标准库中的类型，能以类型安全的方式存储任意其他
+     * ProtoBuf 消息，即使服务端不知道该消息的 schema。
      *
-     * <p>It accomplishes this by storing a tuple of information: an URL-like type declaration for
-     * the stored message, and the serialized binary encoding of the stored message itself. Language
-     * specific implementations of ProtoBuf provide helper methods to encode and decode arbitrary
-     * messages into an {@link Any} object ({@link Any#pack(Message)} in Java).
+     * <p>它通过存储一个二元组实现：一个类 URL 的类型声明，以及消息本身的二进制编码。
+     * 各语言的 ProtoBuf 实现都提供辅助方法把任意消息编码/解码为 {@link Any}
+     * （Java 里是 {@link Any#pack(Message)}）。
      *
-     * <p>We want to expose these {@link Any} objects in the REST API because they've been
-     * introduced as part of the new GRPC interface to Conductor, but unfortunately we cannot encode
-     * them using their canonical ProtoBuf JSON encoding. According to the docs:
+     * <p>我们想在 REST API 中暴露这些 {@link Any} 对象，因为它们是 Conductor 新增
+     * gRPC 接口的一部分。但问题是，我们<b>无法</b>用 ProtoBuf 的规范 JSON 编码来表示它们。
+     * 按官方文档：
      *
-     * <p>The JSON representation of an `Any` value uses the regular representation of the
-     * deserialized, embedded message, with an additional field `@type` which contains the type URL.
-     * Example:
+     * <p>{@code Any} 的 JSON 表示使用被反序列化后嵌入消息的常规表示，外加一个
+     * {@code @type} 字段包含类型 URL。例如：
      *
-     * <p>package google.profile; message Person { string first_name = 1; string last_name = 2; } {
-     * "@type": "type.googleapis.com/google.profile.Person", "firstName": <string>, "lastName":
-     * <string> }
+     * <pre>
+     * package google.profile;
+     * message Person {
+     *   string first_name = 1;
+     *   string last_name = 2;
+     * }
+     * {
+     *   "@type": "type.googleapis.com/google.profile.Person",
+     *   "firstName": &lt;string&gt;,
+     *   "lastName": &lt;string&gt;
+     * }
+     * </pre>
      *
-     * <p>In order to accomplish this representation, the PB-JSON encoder needs to have knowledge of
-     * all the ProtoBuf messages that could be serialized inside the {@link Any} message. This is
-     * not possible to accomplish inside the Conductor server, which is simply passing through
-     * arbitrary payloads from/to clients.
+     * <p>要实现这种表示，PB-JSON 编码器必须知道所有可能被序列化进 {@link Any} 的
+     * ProtoBuf 消息类型。而 Conductor 服务端只是透传客户端之间的任意 payload，
+     * 无法做到这一点。
      *
-     * <p>Consequently, to actually expose the Message through the REST API, we must create a custom
-     * encoding that contains the raw data of the serialized message, as we are not able to
-     * deserialize it on the server. We simply return a dictionary with '@type' and '@value' keys,
-     * where '@type' is identical to the canonical representation, but '@value' contains a base64
-     * encoded string with the binary data of the serialized message.
+     * <p>因此，为了真正通过 REST API 暴露该消息，我们必须自定义一种编码，
+     * 包含序列化消息的原始数据（因为服务端无法反序列化它）。我们返回一个
+     * 带 {@code '@type'} 和 {@code '@value'} 键的字典：{@code '@type'} 与规范表示
+     * 相同，而 {@code '@value'} 包含消息二进制数据的 base64 编码字符串。
      *
-     * <p>Since all the provided Conductor clients are required to know this encoding, it's always
-     * possible to re-build the original {@link Any} message regardless of the client's language.
+     * <p>由于所有官方 Conductor 客户端都要求知道这种编码，所以无论客户端用什么语言，
+     * 都能重建出原始的 {@link Any} 消息。
      *
-     * <p>{@see AnyDeserializer}
+     * @see AnyDeserializer
      */
     @SuppressWarnings("InnerClassMayBeStatic")
     protected class AnySerializer extends JsonSerializer<Any> {
 
+        /**
+         * 序列化 Any 为 JSON：
+         * {
+         *   "@type": "<typeUrl>",
+         *   "@value": "<base64 编码的二进制数据>"
+         * }
+         */
         @Override
         public void serialize(Any value, JsonGenerator jgen, SerializerProvider provider)
                 throws IOException {
             jgen.writeStartObject();
+            // 写入类型 URL
             jgen.writeStringField(JSON_TYPE, value.getTypeUrl());
+            // 写入二进制数据（Jackson 会自动做 base64 编码）
             jgen.writeBinaryField(JSON_VALUE, value.getValue().toByteArray());
             jgen.writeEndObject();
         }
     }
 
     /**
-     * AnyDeserializer converts the custom JSON representation of an {@link Any} value into its
-     * original form.
+     * AnyDeserializer：把 {@link Any} 的自定义 JSON 表示还原为原始对象。
      *
-     * <p>{@see AnySerializer} for details on this representation.
+     * <p>表示格式详见 {@link AnySerializer}。
      */
     @SuppressWarnings("InnerClassMayBeStatic")
     protected class AnyDeserializer extends JsonDeserializer<Any> {
 
+        /**
+         * 从 JSON 反序列化出 Any：
+         * 1. 读取 @type 和 @value 字段
+         * 2. 校验字段存在且为文本
+         * 3. 用 typeUrl + 二进制数据构建 Any
+         */
         @Override
         public Any deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
             JsonNode root = p.getCodec().readTree(p);
             JsonNode type = root.get(JSON_TYPE);
             JsonNode value = root.get(JSON_VALUE);
 
+            // 校验 @type 字段
             if (type == null || !type.isTextual()) {
                 ctxt.reportMappingException(
                         "invalid '@type' field when deserializing ProtoBuf Any object");
             }
 
+            // 校验 @value 字段
             if (value == null || !value.isTextual()) {
                 ctxt.reportMappingException(
                         "invalid '@value' field when deserializing ProtoBuf Any object");
             }
 
+            // 用 typeUrl + 二进制数据重建 Any
             return Any.newBuilder()
                     .setTypeUrl(type.textValue())
                     .setValue(ByteString.copyFrom(value.binaryValue()))
@@ -138,6 +161,9 @@ public class JsonProtoModule extends SimpleModule {
         }
     }
 
+    /**
+     * 构造器：注册 Any 的序列化器和反序列化器。
+     */
     public JsonProtoModule() {
         super(NAME);
         addSerializer(Any.class, new AnySerializer());

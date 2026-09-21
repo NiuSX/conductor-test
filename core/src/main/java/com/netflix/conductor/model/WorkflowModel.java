@@ -26,15 +26,29 @@ import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
+/**
+ * 工作流实例模型：表示一个正在运行/已结束的工作流实例（区别于 WorkflowDef 定义）。
+ *
+ * 这是 Conductor 执行引擎的核心数据模型，会被持久化到数据库。
+ * 它包含：状态、任务列表、输入/输出、父子关系、超时/失败信息等。
+ *
+ * 注意：字段上的 @JsonIgnore 表示运行时内存对象不直接序列化该字段，
+ * 而是通过 getRawInput / getRawOutput 等 @JsonProperty 方法做持久化。
+ */
 public class WorkflowModel {
 
+    /**
+     * 工作流状态枚举，每个状态自带两个标志：
+     * - terminal：是否为终态（不可再变更）
+     * - successful：是否为成功态
+     */
     public enum Status {
-        RUNNING(false, false),
-        COMPLETED(true, true),
-        FAILED(true, false),
-        TIMED_OUT(true, false),
-        TERMINATED(true, false),
-        PAUSED(false, true);
+        RUNNING(false, false),      // 运行中
+        COMPLETED(true, true),      // 已完成（成功）
+        FAILED(true, false),        // 失败
+        TIMED_OUT(true, false),     // 超时
+        TERMINATED(true, false),    // 被终止
+        PAUSED(false, true);        // 暂停（非终态，但视为"成功"以便区分）
 
         private final boolean terminal;
         private final boolean successful;
@@ -53,67 +67,96 @@ public class WorkflowModel {
         }
     }
 
+    /** 当前状态，默认 RUNNING */
     private Status status = Status.RUNNING;
 
+    /** 结束时间（毫秒时间戳） */
     private long endTime;
 
+    /** 工作流实例 id（全局唯一） */
     private String workflowId;
 
+    /** 父工作流 id（若是子工作流） */
     private String parentWorkflowId;
 
+    /** 父工作流中对应本子工作流的任务 id */
     private String parentWorkflowTaskId;
 
+    /** 任务列表（按执行顺序） */
     private List<TaskModel> tasks = new LinkedList<>();
 
+    /** 关联 id，用于把同一业务链路的多个工作流关联起来 */
     private String correlationId;
 
+    /** 若是重跑，记录从哪个工作流 id 重跑 */
     private String reRunFromWorkflowId;
 
+    /** 未完成/失败的原因 */
     private String reasonForIncompletion;
 
+    /** 事件名（用于事件触发的工作流） */
     private String event;
 
+    /** 任务类型 → domain 的映射，用于任务路由 */
     private Map<String, String> taskToDomain = new HashMap<>();
 
+    /** 失败的引用任务名集合（仅非空时序列化） */
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     private Set<String> failedReferenceTaskNames = new HashSet<>();
 
+    /** 失败的任务定义名集合（仅非空时序列化） */
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     private Set<String> failedTaskNames = new HashSet<>();
 
+    /** 工作流定义（启动时固定的快照） */
     private WorkflowDef workflowDefinition;
 
+    /** 输入被外部化存储时的路径（大输入存对象存储） */
     private String externalInputPayloadStoragePath;
 
+    /** 输出被外部化存储时的路径（大输出存对象存储） */
     private String externalOutputPayloadStoragePath;
 
+    /** 优先级（0~99） */
     private int priority;
 
+    /** 工作流变量（运行时可读写） */
     private Map<String, Object> variables = new HashMap<>();
 
+    /** 上次重试时间（用于超时计算基准） */
     private long lastRetriedTime;
 
+    /** 所属应用 */
     private String ownerApp;
 
+    /** 创建时间 */
     private Long createTime;
 
+    /** 更新时间 */
     private Long updatedTime;
 
+    /** 创建者 */
     private String createdBy;
 
+    /** 更新者 */
     private String updatedBy;
 
-    // Capture the failed taskId if the workflow execution failed because of task failure
+    // 若工作流因任务失败而失败，记录失败的任务 id
     private String failedTaskId;
 
+    /** 前一个状态（用于状态变更追踪） */
     private Status previousStatus;
 
+    /** 输入数据（内存态，不直接序列化） */
     @JsonIgnore private Map<String, Object> input = new HashMap<>();
 
+    /** 输出数据（内存态，不直接序列化） */
     @JsonIgnore private Map<String, Object> output = new HashMap<>();
 
+    /** 外部化后的输入数据（内存态） */
     @JsonIgnore private Map<String, Object> inputPayload = new HashMap<>();
 
+    /** 外部化后的输出数据（内存态） */
     @JsonIgnore private Map<String, Object> outputPayload = new HashMap<>();
 
     public Status getPreviousStatus() {
@@ -128,8 +171,9 @@ public class WorkflowModel {
         return status;
     }
 
+    /** 设置状态时自动记录前一个状态（仅当状态确实变化时） */
     public void setStatus(Status status) {
-        // update previous status if current status changed
+        // 状态变化时更新 previousStatus
         if (this.status != status) {
             setPreviousStatus(this.status);
         }
@@ -176,6 +220,10 @@ public class WorkflowModel {
         this.tasks = tasks;
     }
 
+    /**
+     * 获取输入：合并 input 与 inputPayload。
+     * 若两者都有数据，合并后清空 inputPayload；否则返回非空的那个。
+     */
     @JsonIgnore
     public Map<String, Object> getInput() {
         if (!inputPayload.isEmpty() && !input.isEmpty()) {
@@ -197,6 +245,7 @@ public class WorkflowModel {
         this.input = input;
     }
 
+    /** 获取输出：合并 output 与 outputPayload，逻辑同 getInput */
     @JsonIgnore
     public Map<String, Object> getOutput() {
         if (!outputPayload.isEmpty() && !output.isEmpty()) {
@@ -219,7 +268,8 @@ public class WorkflowModel {
     }
 
     /**
-     * @deprecated Used only for JSON serialization and deserialization.
+     * 仅用于 JSON 序列化/反序列化的原始输入访问器。
+     * @deprecated 运行时请使用 getInput()
      */
     @Deprecated
     @JsonProperty("input")
@@ -228,7 +278,8 @@ public class WorkflowModel {
     }
 
     /**
-     * @deprecated Used only for JSON serialization and deserialization.
+     * 仅用于 JSON 序列化/反序列化的原始输入设置器。
+     * @deprecated 运行时请使用 setInput()
      */
     @Deprecated
     @JsonProperty("input")
@@ -237,7 +288,8 @@ public class WorkflowModel {
     }
 
     /**
-     * @deprecated Used only for JSON serialization and deserialization.
+     * 仅用于 JSON 序列化/反序列化的原始输出访问器。
+     * @deprecated 运行时请使用 getOutput()
      */
     @Deprecated
     @JsonProperty("output")
@@ -246,7 +298,8 @@ public class WorkflowModel {
     }
 
     /**
-     * @deprecated Used only for JSON serialization and deserialization.
+     * 仅用于 JSON 序列化/反序列化的原始输出设置器。
+     * @deprecated 运行时请使用 setOutput()
      */
     @Deprecated
     @JsonProperty("output")
@@ -338,6 +391,7 @@ public class WorkflowModel {
         return priority;
     }
 
+    /** 设置优先级，必须在 0~99 之间 */
     public void setPriority(int priority) {
         if (priority < 0 || priority > 99) {
             throw new IllegalArgumentException("priority MUST be between 0 and 99 (inclusive)");
@@ -410,9 +464,8 @@ public class WorkflowModel {
     }
 
     /**
-     * Convenience method for accessing the workflow definition name.
-     *
-     * @return the workflow definition name.
+     * 便捷方法：获取工作流定义名。
+     * @return 工作流定义名
      */
     public String getWorkflowName() {
         Utils.checkNotNull(workflowDefinition, "Workflow definition is null");
@@ -420,22 +473,21 @@ public class WorkflowModel {
     }
 
     /**
-     * Convenience method for accessing the workflow definition version.
-     *
-     * @return the workflow definition version.
+     * 便捷方法：获取工作流定义版本。
+     * @return 工作流定义版本
      */
     public int getWorkflowVersion() {
         Utils.checkNotNull(workflowDefinition, "Workflow definition is null");
         return workflowDefinition.getVersion();
     }
 
+    /** 是否为子工作流（有父工作流 id） */
     public boolean hasParent() {
         return StringUtils.isNotEmpty(parentWorkflowId);
     }
 
     /**
-     * A string representation of all relevant fields that identify this workflow. Intended for use
-     * in log and other system generated messages.
+     * 返回能标识该工作流的简短字符串，用于日志和系统消息。
      */
     public String toShortString() {
         String name = workflowDefinition != null ? workflowDefinition.getName() : null;
@@ -443,6 +495,12 @@ public class WorkflowModel {
         return String.format("%s.%s/%s", name, version, workflowId);
     }
 
+    /**
+     * 按引用名查找任务，返回最后一个匹配的任务（因为同一引用名可能因重试/迭代出现多次）。
+     *
+     * @param refName 任务引用名
+     * @return 匹配的任务；找不到返回 null
+     */
     public TaskModel getTaskByRefName(String refName) {
         if (refName == null) {
             throw new RuntimeException(
@@ -468,23 +526,30 @@ public class WorkflowModel {
         return found.getLast();
     }
 
+    /**
+     * 把输入外部化：把 input 移到 inputPayload，并记录外部存储路径。
+     * 用于大输入存对象存储，避免占用数据库。
+     */
     public void externalizeInput(String path) {
         this.inputPayload = this.input;
         this.input = new HashMap<>();
         this.externalInputPayloadStoragePath = path;
     }
 
+    /** 把输出外部化，逻辑同 externalizeInput */
     public void externalizeOutput(String path) {
         this.outputPayload = this.output;
         this.output = new HashMap<>();
         this.externalOutputPayloadStoragePath = path;
     }
 
+    /** 从外部存储加载输入：把数据放入 inputPayload */
     public void internalizeInput(Map<String, Object> data) {
         this.input = new HashMap<>();
         this.inputPayload = data;
     }
 
+    /** 从外部存储加载输出：把数据放入 outputPayload */
     public void internalizeOutput(Map<String, Object> data) {
         this.output = new HashMap<>();
         this.outputPayload = data;
@@ -522,11 +587,11 @@ public class WorkflowModel {
                 && Objects.equals(getFailedTaskNames(), that.getFailedTaskNames())
                 && Objects.equals(getWorkflowDefinition(), that.getWorkflowDefinition())
                 && Objects.equals(
-                        getExternalInputPayloadStoragePath(),
-                        that.getExternalInputPayloadStoragePath())
+                getExternalInputPayloadStoragePath(),
+                that.getExternalInputPayloadStoragePath())
                 && Objects.equals(
-                        getExternalOutputPayloadStoragePath(),
-                        that.getExternalOutputPayloadStoragePath())
+                getExternalOutputPayloadStoragePath(),
+                that.getExternalOutputPayloadStoragePath())
                 && Objects.equals(getVariables(), that.getVariables())
                 && Objects.equals(getOwnerApp(), that.getOwnerApp())
                 && Objects.equals(getCreateTime(), that.getCreateTime())
@@ -567,6 +632,10 @@ public class WorkflowModel {
                 getUpdatedBy());
     }
 
+    /**
+     * 转换为对外 API 的 Workflow 对象（用于返回给客户端）。
+     * 会复制属性、转换状态枚举、转换任务列表。
+     */
     public Workflow toWorkflow() {
         Workflow workflow = new Workflow();
         BeanUtils.copyProperties(this, workflow);
@@ -574,7 +643,7 @@ public class WorkflowModel {
         workflow.setTasks(tasks.stream().map(TaskModel::toTask).collect(Collectors.toList()));
         workflow.setUpdateTime(this.updatedTime);
 
-        // ensure that input/output is properly represented
+        // 若输入/输出被外部化，对外返回空 map（避免误导）
         if (externalInputPayloadStoragePath != null) {
             workflow.setInput(new HashMap<>());
         }
@@ -584,20 +653,24 @@ public class WorkflowModel {
         return workflow;
     }
 
+    /** 按 key 添加输入 */
     public void addInput(String key, Object value) {
         this.input.put(key, value);
     }
 
+    /** 批量添加输入 */
     public void addInput(Map<String, Object> inputData) {
         if (inputData != null) {
             this.input.putAll(inputData);
         }
     }
 
+    /** 按 key 添加输出 */
     public void addOutput(String key, Object value) {
         this.output.put(key, value);
     }
 
+    /** 批量添加输出 */
     public void addOutput(Map<String, Object> outputData) {
         if (outputData != null) {
             this.output.putAll(outputData);

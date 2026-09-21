@@ -32,10 +32,20 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import static com.netflix.conductor.common.metadata.tasks.TaskType.TASK_TYPE_SUB_WORKFLOW;
 
+/**
+ * SUB_WORKFLOW 系统任务：把一个子工作流作为父工作流中的一个任务来执行。
+ *
+ * 它是异步系统任务（isAsync=true，isAsyncComplete=true），运行机制：
+ * 1. start() 时启动子工作流，记录 subWorkflowId，任务状态置为 IN_PROGRESS
+ * 2. 子工作流完成后，由子工作流的 completeWorkflow 逻辑反向更新该任务状态，
+ *    从而避免父工作流周期性轮询子工作流状态
+ * 3. cancel() 时终止子工作流
+ */
 @Component(TASK_TYPE_SUB_WORKFLOW)
 public class SubWorkflow extends WorkflowSystemTask {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(SubWorkflow.class);
+    /** 输出字段名：子工作流 id（向后兼容） */
     private static final String SUB_WORKFLOW_ID = "subWorkflowId";
 
     private final ObjectMapper objectMapper;
@@ -47,27 +57,36 @@ public class SubWorkflow extends WorkflowSystemTask {
         this.startWorkflowOperation = startWorkflowOperation;
     }
 
+    /**
+     * 启动子工作流任务：
+     * - 从任务输入中读取子工作流名称、版本、定义（可选）、taskToDomain、输入参数
+     * - 通过 StartWorkflowOperation 创建子工作流实例
+     * - 记录 subWorkflowId，并根据子工作流当前状态设置本任务状态
+     */
     @SuppressWarnings("unchecked")
     @Override
     public void start(WorkflowModel workflow, TaskModel task, WorkflowExecutor workflowExecutor) {
         Map<String, Object> input = task.getInputData();
+        // 子工作流名称与版本
         String name = input.get("subWorkflowName").toString();
         int version = (int) input.get("subWorkflowVersion");
 
         WorkflowDef workflowDefinition = null;
         if (input.get("subWorkflowDefinition") != null) {
-            // convert the value back to workflow definition object
+            // 内联子工作流定义：把它转换回 WorkflowDef 对象
             workflowDefinition =
                     objectMapper.convertValue(
                             input.get("subWorkflowDefinition"), WorkflowDef.class);
             name = workflowDefinition.getName();
         }
 
+        // taskToDomain：默认继承父工作流的，若子工作流单独指定则覆盖
         Map<String, String> taskToDomain = workflow.getTaskToDomain();
         if (input.get("subWorkflowTaskToDomain") instanceof Map) {
             taskToDomain = (Map<String, String>) input.get("subWorkflowTaskToDomain");
         }
 
+        // 子工作流输入：若未单独指定 workflowInput，则直接用父任务的 input
         var wfInput = (Map<String, Object>) input.get("workflowInput");
         if (wfInput == null || wfInput.isEmpty()) {
             wfInput = input;
@@ -75,34 +94,37 @@ public class SubWorkflow extends WorkflowSystemTask {
         String correlationId = workflow.getCorrelationId();
 
         try {
+            // 组装启动子工作流的输入
             StartWorkflowInput startWorkflowInput = new StartWorkflowInput();
             startWorkflowInput.setWorkflowDefinition(workflowDefinition);
             startWorkflowInput.setName(name);
             startWorkflowInput.setVersion(version);
             startWorkflowInput.setWorkflowInput(wfInput);
             startWorkflowInput.setCorrelationId(correlationId);
+            // 记录父子关系：父工作流 id + 父任务 id
             startWorkflowInput.setParentWorkflowId(workflow.getWorkflowId());
             startWorkflowInput.setParentWorkflowTaskId(task.getTaskId());
             startWorkflowInput.setTaskToDomain(taskToDomain);
 
+            // 启动子工作流
             String subWorkflowId = startWorkflowOperation.execute(startWorkflowInput);
 
             task.setSubWorkflowId(subWorkflowId);
-            // For backwards compatibility
+            // 向后兼容：同时写入输出字段
             task.addOutput(SUB_WORKFLOW_ID, subWorkflowId);
 
-            // Set task status based on current sub-workflow status, as the status can change in
-            // recursion by the time we update here.
+            // 根据子工作流当前状态设置本任务状态（递归期间状态可能已变化）
             WorkflowModel subWorkflow = workflowExecutor.getWorkflow(subWorkflowId, false);
             updateTaskStatus(subWorkflow, task);
         } catch (TransientException te) {
+            // 临时性后端错误：记录日志，让引擎后续重试（不置为 FAILED）
             LOGGER.info(
                     "A transient backend error happened when task {} in {} tried to start sub workflow {}.",
                     task.getTaskId(),
                     workflow.toShortString(),
                     name);
         } catch (Exception ae) {
-
+            // 其他异常：任务置为 FAILED
             task.setStatus(TaskModel.Status.FAILED);
             task.setReasonForIncompletion(ae.getMessage());
             LOGGER.error(
@@ -113,6 +135,15 @@ public class SubWorkflow extends WorkflowSystemTask {
         }
     }
 
+    /**
+     * 检查子工作流是否已完成：
+     * - 子工作流 id 为空 → 返回 false
+     * - 子工作流未终态 → 返回 false
+     * - 子工作流终态 → 更新本任务状态，返回 true
+     *
+     * 注意：由于 isAsyncComplete=true，正常情况下子工作流完成时会主动反向更新本任务，
+     * 这里主要作为兜底检查。
+     */
     @Override
     public boolean execute(
             WorkflowModel workflow, TaskModel task, WorkflowExecutor workflowExecutor) {
@@ -131,6 +162,10 @@ public class SubWorkflow extends WorkflowSystemTask {
         return true;
     }
 
+    /**
+     * 取消子工作流任务：终止对应的子工作流。
+     * 终止原因取父工作流的终止原因（若有）。
+     */
     @Override
     public void cancel(WorkflowModel workflow, TaskModel task, WorkflowExecutor workflowExecutor) {
         String workflowId = task.getSubWorkflowId();
@@ -143,28 +178,36 @@ public class SubWorkflow extends WorkflowSystemTask {
                 StringUtils.isEmpty(workflow.getReasonForIncompletion())
                         ? "Parent workflow has been terminated with status " + workflow.getStatus()
                         : "Parent workflow has been terminated with reason: "
-                                + workflow.getReasonForIncompletion();
+                        + workflow.getReasonForIncompletion();
         workflowExecutor.terminateWorkflow(subWorkflow, reason, null);
     }
 
+    /** 异步系统任务：由引擎异步调度 */
     @Override
     public boolean isAsync() {
         return true;
     }
 
     /**
-     * Keep Subworkflow task asyncComplete. The Subworkflow task will be executed once
-     * asynchronously to move to IN_PROGRESS state, and will move to termination by Subworkflow's
-     * completeWorkflow logic, there by avoiding periodic polling.
-     *
-     * @param task
-     * @return
+     * 保持 SUB_WORKFLOW 任务为 asyncComplete：
+     * 该任务只会被异步执行一次进入 IN_PROGRESS，之后由子工作流的 completeWorkflow
+     * 逻辑负责把它推进到终态，从而避免父工作流周期性轮询。
      */
     @Override
     public boolean isAsyncComplete(TaskModel task) {
         return true;
     }
 
+    /**
+     * 根据子工作流状态更新本任务状态，并在子工作流终态时同步输出与失败原因。
+     *
+     * 状态映射：
+     * - RUNNING / PAUSED → IN_PROGRESS
+     * - COMPLETED → COMPLETED
+     * - FAILED → FAILED
+     * - TERMINATED → CANCELED
+     * - TIMED_OUT → TIMED_OUT
+     */
     private void updateTaskStatus(WorkflowModel subworkflow, TaskModel task) {
         WorkflowModel.Status status = subworkflow.getStatus();
         switch (status) {
@@ -189,11 +232,14 @@ public class SubWorkflow extends WorkflowSystemTask {
                         "Subworkflow status does not conform to relevant task status.");
         }
 
+        // 子工作流终态：同步输出与失败原因到父任务
         if (status.isTerminal()) {
             if (subworkflow.getExternalOutputPayloadStoragePath() != null) {
+                // 输出存在外部存储：只记录路径
                 task.setExternalOutputPayloadStoragePath(
                         subworkflow.getExternalOutputPayloadStoragePath());
             } else {
+                // 否则把子工作流输出合并到父任务输出
                 task.addOutput(subworkflow.getOutput());
             }
             if (!status.isSuccessful()) {
@@ -207,7 +253,8 @@ public class SubWorkflow extends WorkflowSystemTask {
     }
 
     /**
-     * We don't need the tasks when retrieving the workflow data.
+     * 获取工作流数据时不需要检索任务。
+     * 子工作流任务的完成由子工作流自身反向更新，不需要拉取任务列表，可提升性能。
      *
      * @return false
      */

@@ -35,6 +35,20 @@ import com.netflix.conductor.core.execution.WorkflowExecutor;
 import com.netflix.conductor.core.operation.StartWorkflowOperation;
 import com.netflix.conductor.core.utils.Utils;
 
+/**
+ * WorkflowService 的实现类：工作流实例管理的门面实现。
+ *
+ * 它的角色是"薄封装 + 委托"：
+ * - 启动相关 → 委托给 StartWorkflowOperation
+ * - 生命周期操作 → 委托给 WorkflowExecutor
+ * - 查询/搜索 → 委托给 ExecutionService
+ * - 定义查询 → 委托给 MetadataService
+ *
+ * 它自身不做业务逻辑，只负责编排调用、参数组装和异常转换。
+ *
+ * @Audit 记录审计日志
+ * @Trace 记录调用链追踪
+ */
 @Audit
 @Trace
 @Service
@@ -57,28 +71,16 @@ public class WorkflowServiceImpl implements WorkflowService {
     }
 
     /**
-     * Start a new workflow with StartWorkflowRequest, which allows task to be executed in a domain.
-     *
-     * @param startWorkflowRequest StartWorkflow request for the workflow you want to start.
-     * @return the id of the workflow instance that can be use for tracking.
+     * 用 StartWorkflowRequest 启动新工作流。
+     * 直接把请求包装成 StartWorkflowInput，委托给 StartWorkflowOperation。
      */
     public String startWorkflow(StartWorkflowRequest startWorkflowRequest) {
         return startWorkflowOperation.execute(new StartWorkflowInput(startWorkflowRequest));
     }
 
     /**
-     * Start a new workflow with StartWorkflowRequest, which allows task to be executed in a domain.
-     *
-     * @param name Name of the workflow you want to start.
-     * @param version Version of the workflow you want to start.
-     * @param correlationId CorrelationID of the workflow you want to start.
-     * @param priority Priority of the workflow you want to start.
-     * @param input Input to the workflow you want to start.
-     * @param externalInputPayloadStoragePath the relative path in external storage where input *
-     *     payload is located
-     * @param taskToDomain the task to domain mapping
-     * @param workflowDef - workflow definition
-     * @return the id of the workflow instance that can be use for tracking.
+     * 启动新工作流（完整参数版，支持外部存储路径、taskToDomain、内联定义）。
+     * 逐个字段组装 StartWorkflowInput，再委托给 StartWorkflowOperation。
      */
     public String startWorkflow(
             String name,
@@ -103,15 +105,8 @@ public class WorkflowServiceImpl implements WorkflowService {
     }
 
     /**
-     * Start a new workflow. Returns the ID of the workflow instance that can be later used for
-     * tracking.
-     *
-     * @param name Name of the workflow you want to start.
-     * @param version Version of the workflow you want to start.
-     * @param correlationId CorrelationID of the workflow you want to start.
-     * @param priority Priority of the workflow you want to start.
-     * @param input Input to the workflow you want to start.
-     * @return the id of the workflow instance that can be use for tracking.
+     * 启动新工作流（简化版）：按 name + version 从 MetadataService 查定义，再启动。
+     * 若定义不存在，抛 NotFoundException。
      */
     public String startWorkflow(
             String name,
@@ -119,6 +114,7 @@ public class WorkflowServiceImpl implements WorkflowService {
             String correlationId,
             Integer priority,
             Map<String, Object> input) {
+        // 从元数据服务查询工作流定义
         WorkflowDef workflowDef = metadataService.getWorkflowDef(name, version);
         if (workflowDef == null) {
             throw new NotFoundException(
@@ -126,6 +122,7 @@ public class WorkflowServiceImpl implements WorkflowService {
         }
 
         StartWorkflowInput startWorkflowInput = new StartWorkflowInput();
+        // 用定义中的真实 name/version（version 可能传 null，由 MetadataService 解析为最新）
         startWorkflowInput.setName(workflowDef.getName());
         startWorkflowInput.setVersion(workflowDef.getVersion());
         startWorkflowInput.setCorrelationId(correlationId);
@@ -135,30 +132,14 @@ public class WorkflowServiceImpl implements WorkflowService {
         return startWorkflowOperation.execute(startWorkflowInput);
     }
 
-    /**
-     * Lists workflows for the given correlation id.
-     *
-     * @param name Name of the workflow.
-     * @param correlationId CorrelationID of the workflow you want to start.
-     * @param includeClosed IncludeClosed workflow which are not running.
-     * @param includeTasks Includes tasks associated with workflows.
-     * @return a list of {@link Workflow}
-     */
+    /** 按 correlationId 列出工作流实例，委托给 ExecutionService */
     public List<Workflow> getWorkflows(
             String name, String correlationId, boolean includeClosed, boolean includeTasks) {
         return executionService.getWorkflowInstances(
                 name, correlationId, includeClosed, includeTasks);
     }
 
-    /**
-     * Lists workflows for the given correlation id.
-     *
-     * @param name Name of the workflow.
-     * @param includeClosed CorrelationID of the workflow you want to start.
-     * @param includeTasks IncludeClosed workflow which are not running.
-     * @param correlationIds Includes tasks associated with workflows.
-     * @return a {@link Map} of {@link String} as key and a list of {@link Workflow} as value
-     */
+    /** 按多个 correlationId 批量列出工作流实例，逐个查询后组装成 Map */
     public Map<String, List<Workflow>> getWorkflows(
             String name, boolean includeClosed, boolean includeTasks, List<String> correlationIds) {
         Map<String, List<Workflow>> workflowMap = new HashMap<>();
@@ -171,13 +152,7 @@ public class WorkflowServiceImpl implements WorkflowService {
         return workflowMap;
     }
 
-    /**
-     * Gets the workflow by workflow id.
-     *
-     * @param workflowId id of the workflow.
-     * @param includeTasks Includes tasks associated with workflow.
-     * @return an instance of {@link Workflow}
-     */
+    /** 按 workflowId 获取执行状态，找不到抛 NotFoundException */
     public Workflow getExecutionStatus(String workflowId, boolean includeTasks) {
         Workflow workflow = executionService.getExecutionStatus(workflowId, includeTasks);
         if (workflow == null) {
@@ -186,24 +161,15 @@ public class WorkflowServiceImpl implements WorkflowService {
         return workflow;
     }
 
-    /**
-     * Removes the workflow from the system.
-     *
-     * @param workflowId WorkflowID of the workflow you want to remove from system.
-     * @param archiveWorkflow Archives the workflow and associated tasks instead of removing them.
-     */
+    /** 删除工作流（archiveWorkflow=true 时归档而非物理删除） */
     public void deleteWorkflow(String workflowId, boolean archiveWorkflow) {
         executionService.removeWorkflow(workflowId, archiveWorkflow);
     }
 
     /**
-     * Retrieves all the running workflows.
-     *
-     * @param workflowName Name of the workflow.
-     * @param version Version of the workflow.
-     * @param startTime start time of the workflow.
-     * @param endTime EndTime of the workflow
-     * @return a list of workflow Ids.
+     * 查询运行中的工作流 id 列表。
+     * - 若指定了 startTime/endTime：走 workflowExecutor.getWorkflows（按时间范围查）
+     * - 否则：解析 version（未指定则取最新），走 getRunningWorkflowIds
      */
     public List<String> getRunningWorkflows(
             String workflowName, Integer version, Long startTime, Long endTime) {
@@ -211,6 +177,7 @@ public class WorkflowServiceImpl implements WorkflowService {
                 && Optional.ofNullable(endTime).orElse(0L) != 0) {
             return workflowExecutor.getWorkflows(workflowName, version, startTime, endTime);
         } else {
+            // 未指定 version 时，从 MetadataService 取最新版本
             version =
                     Optional.ofNullable(version)
                             .orElseGet(
@@ -223,237 +190,109 @@ public class WorkflowServiceImpl implements WorkflowService {
         }
     }
 
-    /**
-     * Starts the decision task for a workflow.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     */
+    /** 手动触发一次 decide，推进工作流 */
     public void decideWorkflow(String workflowId) {
         workflowExecutor.decide(workflowId);
     }
 
-    /**
-     * Pauses the workflow given a workflowId.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     */
+    /** 暂停工作流 */
     public void pauseWorkflow(String workflowId) {
         workflowExecutor.pauseWorkflow(workflowId);
     }
 
-    /**
-     * Resumes the workflow.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     */
+    /** 恢复工作流 */
     public void resumeWorkflow(String workflowId) {
         workflowExecutor.resumeWorkflow(workflowId);
     }
 
-    /**
-     * Skips a given task from a current running workflow.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     * @param taskReferenceName The task reference name.
-     * @param skipTaskRequest {@link SkipTaskRequest} for task you want to skip.
-     */
+    /** 跳过运行中工作流的指定任务 */
     public void skipTaskFromWorkflow(
             String workflowId, String taskReferenceName, SkipTaskRequest skipTaskRequest) {
         workflowExecutor.skipTaskFromWorkflow(workflowId, taskReferenceName, skipTaskRequest);
     }
 
     /**
-     * Reruns the workflow from a specific task.
-     *
-     * @param workflowId WorkflowId of the workflow you want to rerun.
-     * @param request (@link RerunWorkflowRequest) for the workflow.
-     * @return WorkflowId of the rerun workflow.
+     * 从指定任务开始重跑工作流。
+     * 注意：把 workflowId 写入 request 的 reRunFromWorkflowId 字段后再委托。
      */
     public String rerunWorkflow(String workflowId, RerunWorkflowRequest request) {
         request.setReRunFromWorkflowId(workflowId);
         return workflowExecutor.rerun(request);
     }
 
-    /**
-     * Restarts a completed workflow.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     * @param useLatestDefinitions if true, use the latest workflow and task definitions upon
-     *     restart
-     */
+    /** 重启已完成的工作流（useLatestDefinitions 决定是否用最新定义） */
     public void restartWorkflow(String workflowId, boolean useLatestDefinitions) {
         workflowExecutor.restart(workflowId, useLatestDefinitions);
     }
 
-    /**
-     * Retries the last failed task.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     */
+    /** 重试最后一个失败的任务（resumeSubworkflowTasks 决定是否深入子工作流） */
     public void retryWorkflow(String workflowId, boolean resumeSubworkflowTasks) {
         workflowExecutor.retry(workflowId, resumeSubworkflowTasks);
     }
 
-    /**
-     * Resets callback times of all non-terminal SIMPLE tasks to 0.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     */
+    /** 重置所有非终态 SIMPLE 任务的回调时间为 0 */
     public void resetWorkflow(String workflowId) {
         workflowExecutor.resetCallbacksForWorkflow(workflowId);
     }
 
-    /**
-     * Terminate workflow execution.
-     *
-     * @param workflowId WorkflowId of the workflow.
-     * @param reason Reason for terminating the workflow.
-     */
+    /** 终止工作流 */
     public void terminateWorkflow(String workflowId, String reason) {
         workflowExecutor.terminateWorkflow(workflowId, reason);
     }
 
-    /**
-     * Search for workflows based on payload and given parameters. Use sort options as sort ASCor
-     * DESC e.g. sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 搜索工作流（摘要版），sort 字符串转成列表后委托给 ExecutionService */
     public SearchResult<WorkflowSummary> searchWorkflows(
             int start, int size, String sort, String freeText, String query) {
         return executionService.search(
                 query, freeText, start, size, Utils.convertStringToList(sort));
     }
 
-    /**
-     * Search for workflows based on payload and given parameters. Use sort options as sort ASCor
-     * DESC e.g. sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 搜索工作流（完整版 V2），sort 字符串转成列表后委托 */
     public SearchResult<Workflow> searchWorkflowsV2(
             int start, int size, String sort, String freeText, String query) {
         return executionService.searchV2(
                 query, freeText, start, size, Utils.convertStringToList(sort));
     }
 
-    /**
-     * Search for workflows based on payload and given parameters. Use sort options as sort ASCor
-     * DESC e.g. sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort list of sorting options, separated by "|" delimiter
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 搜索工作流（摘要版，直接传 sort 列表） */
     public SearchResult<WorkflowSummary> searchWorkflows(
             int start, int size, List<String> sort, String freeText, String query) {
         return executionService.search(query, freeText, start, size, sort);
     }
 
-    /**
-     * Search for workflows based on payload and given parameters. Use sort options as sort ASCor
-     * DESC e.g. sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort list of sorting options, separated by "|" delimiter
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 搜索工作流（完整版 V2，直接传 sort 列表） */
     public SearchResult<Workflow> searchWorkflowsV2(
             int start, int size, List<String> sort, String freeText, String query) {
         return executionService.searchV2(query, freeText, start, size, sort);
     }
 
-    /**
-     * Search for workflows based on task parameters. Use sort options as sort ASC or DESC e.g.
-     * sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 按任务参数搜索工作流（摘要版），sort 字符串转列表 */
     public SearchResult<WorkflowSummary> searchWorkflowsByTasks(
             int start, int size, String sort, String freeText, String query) {
         return executionService.searchWorkflowByTasks(
                 query, freeText, start, size, Utils.convertStringToList(sort));
     }
 
-    /**
-     * Search for workflows based on task parameters. Use sort options as sort ASC or DESC e.g.
-     * sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 按任务参数搜索工作流（完整版 V2），sort 字符串转列表 */
     public SearchResult<Workflow> searchWorkflowsByTasksV2(
             int start, int size, String sort, String freeText, String query) {
         return executionService.searchWorkflowByTasksV2(
                 query, freeText, start, size, Utils.convertStringToList(sort));
     }
 
-    /**
-     * Search for workflows based on task parameters. Use sort options as sort ASC or DESC e.g.
-     * sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort list of sorting options, separated by "|" delimiter
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 按任务参数搜索工作流（摘要版，直接传 sort 列表） */
     public SearchResult<WorkflowSummary> searchWorkflowsByTasks(
             int start, int size, List<String> sort, String freeText, String query) {
         return executionService.searchWorkflowByTasks(query, freeText, start, size, sort);
     }
 
-    /**
-     * Search for workflows based on task parameters. Use sort options as sort ASC or DESC e.g.
-     * sort=name or sort=workflowId:DESC. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort list of sorting options, separated by "|" delimiter
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 按任务参数搜索工作流（完整版 V2，直接传 sort 列表） */
     public SearchResult<Workflow> searchWorkflowsByTasksV2(
             int start, int size, List<String> sort, String freeText, String query) {
         return executionService.searchWorkflowByTasksV2(query, freeText, start, size, sort);
     }
 
-    /**
-     * Get the external storage location where the workflow input payload is stored/to be stored
-     *
-     * @param path the path for which the external storage location is to be populated
-     * @param operation the operation to be performed (read or write)
-     * @param type the type of payload (input or output)
-     * @return {@link ExternalStorageLocation} containing the uri and the path to the payload is
-     *     stored in external storage
-     */
+    /** 获取外部存储位置，用于读写工作流 input/output payload */
     public ExternalStorageLocation getExternalStorageLocation(
             String path, String operation, String type) {
         return executionService.getExternalStorageLocation(path, operation, type);

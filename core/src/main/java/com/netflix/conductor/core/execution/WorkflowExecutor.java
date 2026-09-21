@@ -59,18 +59,26 @@ import com.netflix.conductor.service.ExecutionLockService;
 import static com.netflix.conductor.core.utils.Utils.DECIDER_QUEUE;
 import static com.netflix.conductor.model.TaskModel.Status.*;
 
-/** Workflow services provider interface */
+/**
+ * 工作流执行器：Conductor 的核心调度组件。
+ * 负责工作流的启动、推进（decide）、任务调度、重试、重启、终止、暂停/恢复等。
+ * 它是整个"持久化执行引擎"的中枢——每一步状态变更都会持久化，从而支持故障恢复。
+ */
 @Trace
 @Component
 public class WorkflowExecutor {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(WorkflowExecutor.class);
+    /** 加急优先级：用于把某些工作流推到 decider 队列前面优先评估 */
     private static final int EXPEDITED_PRIORITY = 10;
     private static final String CLASS_NAME = WorkflowExecutor.class.getSimpleName();
+    /** 谓词：任务处于"失败/超时等非成功且终态" */
     private static final Predicate<TaskModel> UNSUCCESSFUL_TERMINAL_TASK =
             task -> !task.getStatus().isSuccessful() && task.getStatus().isTerminal();
+    /** 谓词：非成功的 JOIN 终态任务（用于重试时特殊处理 JOIN） */
     private static final Predicate<TaskModel> UNSUCCESSFUL_JOIN_TASK =
             UNSUCCESSFUL_TERMINAL_TASK.and(t -> TaskType.TASK_TYPE_JOIN.equals(t.getTaskType()));
+    /** 谓词：非终态任务 */
     private static final Predicate<TaskModel> NON_TERMINAL_TASK =
             task -> !task.getStatus().isTerminal();
     private final MetadataDAO metadataDAO;
@@ -85,14 +93,17 @@ public class WorkflowExecutor {
     private final TaskStatusListener taskStatusListener;
     private final SystemTaskRegistry systemTaskRegistry;
     private final ApplicationEventPublisher eventPublisher;
+    /** worker 最近一次 poll 的超时窗口（毫秒），用于判断 domain 是否活跃 */
     private long activeWorkerLastPollMs;
     private final ExecutionLockService executionLockService;
 
+    /** 谓词：判断某个 poll 记录是否在活跃时间窗口内 */
     private final Predicate<PollData> validateLastPolledTime =
             pollData ->
                     pollData.getLastPollTime()
                             > System.currentTimeMillis() - activeWorkerLastPollMs;
 
+    /** 构造器：注入所有依赖组件 */
     public WorkflowExecutor(
             DeciderService deciderService,
             MetadataDAO metadataDAO,
@@ -124,8 +135,12 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param workflowId the id of the workflow for which task callbacks are to be reset
-     * @throws ConflictException if the workflow is in terminal state
+     * 重置工作流中任务的回调时间。
+     * 把处于 SCHEDULED 且 callbackAfterSeconds > 0 的 SIMPLE 任务重置为 0，
+     * 让它们可以立即被重新调度。
+     *
+     * @param workflowId 要重置回调的工作流 id
+     * @throws ConflictException 如果工作流已处于终态
      */
     public void resetCallbacksForWorkflow(String workflowId) {
         WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, true);
@@ -134,8 +149,7 @@ public class WorkflowExecutor {
                     "Workflow is in terminal state. Status = %s", workflow.getStatus());
         }
 
-        // Get SIMPLE tasks in SCHEDULED state that have callbackAfterSeconds > 0 and set the
-        // callbackAfterSeconds to 0
+        // 找出非系统任务、SCHEDULED 状态、且 callbackAfterSeconds > 0 的任务，把回调时间重置为 0
         workflow.getTasks().stream()
                 .filter(
                         task ->
@@ -152,6 +166,7 @@ public class WorkflowExecutor {
                         });
     }
 
+    /** 重跑入口：校验参数后调用 rerunWF */
     public String rerun(RerunWorkflowRequest request) {
         Utils.checkNotNull(request.getReRunFromWorkflowId(), "reRunFromWorkflowId is missing");
         if (!rerunWF(
@@ -167,16 +182,18 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param workflowId the id of the workflow to be restarted
-     * @param useLatestDefinitions if true, use the latest workflow and task definitions upon
-     *     restart
-     * @throws ConflictException Workflow is not in a terminal state.
-     * @throws NotFoundException Workflow definition is not found or Workflow is deemed
-     *     non-restartable as per workflow definition.
+     * 重启一个已处于终态的工作流（从头开始，或使用最新定义）。
+     * 与 retry 不同：restart 会清空所有任务，重新开始整个工作流。
+     *
+     * @param workflowId 要重启的工作流 id
+     * @param useLatestDefinitions 是否使用最新的工作流/任务定义
+     * @throws ConflictException 工作流不在终态
+     * @throws NotFoundException 找不到定义，或按定义不可重启
      */
     public void restart(String workflowId, boolean useLatestDefinitions) {
         final WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, true);
 
+        // 只有终态工作流才能重启
         if (!workflow.getStatus().isTerminal()) {
             String errorMsg =
                     String.format(
@@ -187,6 +204,7 @@ public class WorkflowExecutor {
 
         WorkflowDef workflowDef;
         if (useLatestDefinitions) {
+            // 使用最新定义
             workflowDef =
                     metadataDAO
                             .getLatestWorkflowDef(workflow.getWorkflowName())
@@ -198,6 +216,7 @@ public class WorkflowExecutor {
             workflow.setWorkflowDefinition(workflowDef);
             workflowDef = metadataMapperService.populateTaskDefinitions(workflowDef);
         } else {
+            // 使用工作流启动时固定的定义
             workflowDef =
                     Optional.ofNullable(workflow.getWorkflowDefinition())
                             .orElseGet(
@@ -213,16 +232,17 @@ public class WorkflowExecutor {
                                                                             workflowId)));
         }
 
+        // 如果定义不可重启，且工作流是 COMPLETED，则不允许重启
         if (!workflowDef.isRestartable()
                 && workflow.getStatus()
-                        .equals(
-                                WorkflowModel.Status
-                                        .COMPLETED)) { // Can only restart non-completed workflows
+                .equals(
+                        WorkflowModel.Status
+                                .COMPLETED)) { // Can only restart non-completed workflows
             // when the configuration is set to false
             throw new NotFoundException("Workflow: %s is non-restartable", workflow);
         }
 
-        // Reset the workflow in the primary datastore and remove from indexer; then re-create it
+        // 重置主存储中的工作流，并从索引器移除；然后重新创建
         executionDAOFacade.resetWorkflow(workflowId);
 
         workflow.getTasks().clear();
@@ -231,7 +251,7 @@ public class WorkflowExecutor {
         workflow.setCreateTime(System.currentTimeMillis());
         workflow.setEndTime(0);
         workflow.setLastRetriedTime(0);
-        // Change the status to running
+        // 状态改为 RUNNING
         workflow.setStatus(WorkflowModel.Status.RUNNING);
         workflow.setOutput(null);
         workflow.setExternalOutputPayloadStoragePath(null);
@@ -253,11 +273,11 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Gets the last instance of each failed task and reschedule each Gets all cancelled tasks and
-     * schedule all of them except JOIN (join should change status to INPROGRESS) Switch workflow
-     * back to RUNNING status and call decider.
+     * 重试一个已失败的终态工作流。
+     * 只重试失败/取消的任务，而不是整个工作流（与 restart 区别）。
      *
-     * @param workflowId the id of the workflow to be retried
+     * @param workflowId 要重试的工作流 id
+     * @param resumeSubworkflowTasks 是否深入子工作流，找到最内层失败的任务再重试
      */
     public void retry(String workflowId, boolean resumeSubworkflowTasks) {
         WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, true);
@@ -270,6 +290,7 @@ public class WorkflowExecutor {
         }
 
         if (resumeSubworkflowTasks) {
+            // 找到第一个非成功终态任务，若是子工作流任务则递归深入
             Optional<TaskModel> taskToRetry =
                     workflow.getTasks().stream().filter(UNSUCCESSFUL_TERMINAL_TASK).findFirst();
             if (taskToRetry.isPresent()) {
@@ -283,14 +304,18 @@ public class WorkflowExecutor {
         }
     }
 
+    /**
+     * 逐级向上更新父工作流中的子工作流任务状态，并推入 decider 队列触发异步评估。
+     * 用于子工作流被重试/重启/重跑后，让父工作流感知到变化。
+     */
     private void updateAndPushParents(WorkflowModel workflow, String operation) {
         String workflowIdentifier = "";
         while (workflow.hasParent()) {
-            // update parent's sub workflow task
+            // 更新父工作流中的子工作流任务
             TaskModel subWorkflowTask =
                     executionDAOFacade.getTaskModel(workflow.getParentWorkflowTaskId());
             if (subWorkflowTask.getWorkflowTask().isOptional()) {
-                // break out
+                // 可选子工作流任务，跳过更新父级
                 LOGGER.info(
                         "Sub workflow task {} is optional, skip updating parents", subWorkflowTask);
                 break;
@@ -299,12 +324,12 @@ public class WorkflowExecutor {
             subWorkflowTask.setStatus(IN_PROGRESS);
             executionDAOFacade.updateTask(subWorkflowTask);
 
-            // add an execution log
+            // 添加执行日志
             String currentWorkflowIdentifier = workflow.toShortString();
             workflowIdentifier =
                     !workflowIdentifier.equals("")
                             ? String.format(
-                                    "%s -> %s", currentWorkflowIdentifier, workflowIdentifier)
+                            "%s -> %s", currentWorkflowIdentifier, workflowIdentifier)
                             : currentWorkflowIdentifier;
             TaskExecLog log =
                     new TaskExecLog(
@@ -313,7 +338,7 @@ public class WorkflowExecutor {
             executionDAOFacade.addTaskExecLog(Collections.singletonList(log));
             LOGGER.info("Task {} updated. {}", log.getTaskId(), log.getLog());
 
-            // push the parent workflow to decider queue for asynchronous 'decide'
+            // 把父工作流推入 decider 队列，异步触发 'decide'
             String parentWorkflowId = workflow.getParentWorkflowId();
             WorkflowModel parentWorkflow =
                     executionDAOFacade.getWorkflowModel(parentWorkflowId, true);
@@ -326,12 +351,13 @@ public class WorkflowExecutor {
         }
     }
 
+    /**
+     * 内部 retry 实现：收集可重试任务（失败/超时/取消），把它们重新调度为 SCHEDULED。
+     * 特殊处理：CANCELED 的 JOIN / DO_WHILE 任务改为 IN_PROGRESS 并重新入队。
+     */
     private void retry(WorkflowModel workflow) {
-        // Get all FAILED or CANCELED tasks that are not COMPLETED (or reach other terminal states)
-        // on further executions.
-        // // Eg: for Seq of tasks task1.CANCELED, task1.COMPLETED, task1 shouldn't be retried.
-        // Throw an exception if there are no FAILED tasks.
-        // Handle JOIN task CANCELED status as special case.
+        // 收集可重试任务：FAILED / FAILED_WITH_TERMINAL_ERROR / TIMED_OUT / CANCELED
+        // 但同一 referenceTaskName 若后续已 COMPLETED，则不再重试。
         Map<String, TaskModel> retriableMap = new HashMap<>();
         for (TaskModel task : workflow.getTasks()) {
             switch (task.getStatus()) {
@@ -343,35 +369,33 @@ public class WorkflowExecutor {
                 case CANCELED:
                     if (task.getTaskType().equalsIgnoreCase(TaskType.JOIN.toString())
                             || task.getTaskType().equalsIgnoreCase(TaskType.DO_WHILE.toString())) {
+                        // JOIN / DO_WHILE 被取消时特殊处理：改回 IN_PROGRESS 重新入队
                         task.setStatus(IN_PROGRESS);
                         addTaskToQueue(task);
-                        // Task doesn't have to be updated yet. Will be updated along with other
-                        // Workflow tasks downstream.
                     } else {
                         retriableMap.put(task.getReferenceTaskName(), task);
                     }
                     break;
                 default:
+                    // 其他状态（含 COMPLETED）会从重试集合中移除
                     retriableMap.remove(task.getReferenceTaskName());
                     break;
             }
         }
 
-        // if workflow TIMED_OUT due to timeoutSeconds configured in the workflow definition,
-        // it may not have any unsuccessful tasks that can be retried
+        // 若没有可重试任务，且不是 TIMED_OUT 状态，则抛异常
         if (retriableMap.values().size() == 0
                 && workflow.getStatus() != WorkflowModel.Status.TIMED_OUT) {
             throw new ConflictException(
                     "There are no retryable tasks! Use restart if you want to attempt entire workflow execution again.");
         }
 
-        // Update Workflow with new status.
-        // This should load Workflow from archive, if archived.
+        // 更新工作流状态为 RUNNING
         workflow.setStatus(WorkflowModel.Status.RUNNING);
         workflow.setLastRetriedTime(System.currentTimeMillis());
         String lastReasonForIncompletion = workflow.getReasonForIncompletion();
         workflow.setReasonForIncompletion(null);
-        // Add to decider queue
+        // 推入 decider 队列
         queueDAO.push(
                 DECIDER_QUEUE,
                 workflow.getWorkflowId(),
@@ -383,8 +407,7 @@ public class WorkflowExecutor {
                 workflow.toShortString(),
                 lastReasonForIncompletion);
 
-        // taskToBeRescheduled would set task `retried` to true, and hence it's important to
-        // updateTasks after obtaining task copy from taskToBeRescheduled.
+        // 生成重试任务副本（新 taskId、retryCount+1、状态 SCHEDULED）
         final WorkflowModel finalWorkflow = workflow;
         List<TaskModel> retriableTasks =
                 retriableMap.values().stream()
@@ -393,12 +416,14 @@ public class WorkflowExecutor {
                         .collect(Collectors.toList());
 
         dedupAndAddTasks(workflow, retriableTasks);
-        // Note: updateTasks before updateWorkflow might fail when Workflow is archived and doesn't
-        // exist in primary store.
         executionDAOFacade.updateTasks(workflow.getTasks());
         scheduleTask(workflow, retriableTasks);
     }
 
+    /**
+     * 递归查找最内层失败的子工作流。
+     * 如果任务本身是失败的 SUB_WORKFLOW，则进入该子工作流继续查找。
+     */
     private WorkflowModel findLastFailedSubWorkflowIfAny(
             TaskModel task, WorkflowModel parentWorkflow) {
         if (TaskType.TASK_TYPE_SUB_WORKFLOW.equals(task.getTaskType())
@@ -415,10 +440,11 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Reschedule a task
+     * 把一个失败/取消的任务转换成可重试的新任务：
+     * 新 taskId、retryCount+1、状态 SCHEDULED，并重置各种运行时字段。
      *
-     * @param task failed or cancelled task
-     * @return new instance of a task with "SCHEDULED" status
+     * @param task 失败或取消的任务
+     * @return 状态为 SCHEDULED 的新任务实例
      */
     private TaskModel taskToBeRescheduled(WorkflowModel workflow, TaskModel task) {
         TaskModel taskToBeRetried = task.copy();
@@ -437,7 +463,7 @@ public class WorkflowExecutor {
         taskToBeRetried.setReasonForIncompletion(null);
         taskToBeRetried.setSeq(0);
 
-        // perform parameter replacement for retried task
+        // 为重试任务重新做参数替换
         Map<String, Object> taskInput =
                 parametersUtils.getTaskInput(
                         taskToBeRetried.getWorkflowTask().getInputParameters(),
@@ -447,12 +473,17 @@ public class WorkflowExecutor {
         taskToBeRetried.getInputData().putAll(taskInput);
 
         task.setRetried(true);
-        // since this task is being retried and a retry has been computed, task lifecycle is
-        // complete
+        // 原任务生命周期结束
         task.setExecuted(true);
         return taskToBeRetried;
     }
 
+    /**
+     * 结束工作流执行：
+     * - 若有 TERMINATE 任务，按其 terminationStatus 决定 FAILED 还是 COMPLETED
+     * - 否则视为 COMPLETED
+     * - 最后取消所有非终态任务
+     */
     private void endExecution(WorkflowModel workflow, TaskModel terminateTask) {
         if (terminateTask != null) {
             String terminationStatus =
@@ -489,15 +520,18 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param workflow the workflow to be completed
-     * @throws ConflictException if workflow is already in terminal state.
+     * 把工作流标记为 COMPLETED，并更新失败任务名集合、通知监听器、更新父工作流。
+     *
+     * @param workflow 要完成的工作流
+     * @throws ConflictException 如果工作流已是终态
      */
     @VisibleForTesting
     WorkflowModel completeWorkflow(WorkflowModel workflow) {
         LOGGER.debug("Completing workflow execution for {}", workflow.getWorkflowId());
 
         if (workflow.getStatus().equals(WorkflowModel.Status.COMPLETED)) {
-            queueDAO.remove(DECIDER_QUEUE, workflow.getWorkflowId()); // remove from the sweep queue
+            // 已完成后，从 decider 队列移除，并从 pending 列表移除
+            queueDAO.remove(DECIDER_QUEUE, workflow.getWorkflowId());
             executionDAOFacade.removeFromPendingWorkflow(
                     workflow.getWorkflowName(), workflow.getWorkflowId());
             LOGGER.debug("Workflow: {} has already been completed.", workflow.getWorkflowId());
@@ -515,7 +549,7 @@ public class WorkflowExecutor {
 
         workflow.setStatus(WorkflowModel.Status.COMPLETED);
 
-        // update the failed reference task names
+        // 收集失败任务，记录到 failedReferenceTaskNames / failedTaskNames
         List<TaskModel> failedTasks =
                 workflow.getTasks().stream()
                         .filter(
@@ -544,6 +578,7 @@ public class WorkflowExecutor {
                 workflow.getEndTime() - workflow.getCreateTime(),
                 workflow.getOwnerApp());
 
+        // 若有父工作流，更新父工作流中的子工作流任务，并加急评估父工作流
         if (workflow.hasParent()) {
             updateParentWorkflowTask(workflow);
             LOGGER.info(
@@ -559,6 +594,7 @@ public class WorkflowExecutor {
         return workflow;
     }
 
+    /** 终止工作流（简单入口）：设置状态为 TERMINATED 并调用完整终止逻辑 */
     public void terminateWorkflow(String workflowId, String reason) {
         WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, true);
         if (WorkflowModel.Status.COMPLETED.equals(workflow.getStatus())) {
@@ -569,10 +605,12 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param workflow the workflow to be terminated
-     * @param reason the reason for termination
-     * @param failureWorkflow the failure workflow (if any) to be triggered as a result of this
-     *     termination
+     * 完整的终止工作流逻辑：加锁、更新状态、写失败任务、通知监听器、
+     * 从队列移除任务、更新父工作流、可选的失败工作流触发、取消所有非终态任务。
+     *
+     * @param workflow 要终止的工作流
+     * @param reason 终止原因
+     * @param failureWorkflow 失败后要触发的失败工作流（可选）
      */
     public WorkflowModel terminateWorkflow(
             WorkflowModel workflow, String reason, String failureWorkflow) {
@@ -586,7 +624,7 @@ public class WorkflowExecutor {
             try {
                 deciderService.updateWorkflowOutput(workflow, null);
             } catch (Exception e) {
-                // catch any failure in this step and continue the execution of terminating workflow
+                // 更新输出失败不影响终止流程，记录后继续
                 LOGGER.error(
                         "Failed to update output data for workflow: {}",
                         workflow.getWorkflowId(),
@@ -594,14 +632,14 @@ public class WorkflowExecutor {
                 Monitors.error(CLASS_NAME, "terminateWorkflow");
             }
 
-            // update the failed reference task names
+            // 收集失败任务名
             List<TaskModel> failedTasks =
                     workflow.getTasks().stream()
                             .filter(
                                     t ->
                                             FAILED.equals(t.getStatus())
                                                     || FAILED_WITH_TERMINAL_ERROR.equals(
-                                                            t.getStatus()))
+                                                    t.getStatus()))
                             .collect(Collectors.toList());
 
             workflow.getFailedReferenceTaskNames()
@@ -625,7 +663,7 @@ public class WorkflowExecutor {
             LOGGER.info("Workflow {} is terminated because of {}", workflowId, reason);
             List<TaskModel> tasks = workflow.getTasks();
             try {
-                // Remove from the task queue if they were there
+                // 从任务队列中移除所有任务
                 tasks.forEach(
                         task -> queueDAO.remove(QueueUtils.getQueueName(task), task.getTaskId()));
             } catch (Exception e) {
@@ -635,6 +673,7 @@ public class WorkflowExecutor {
                         e);
             }
 
+            // 更新父工作流
             if (workflow.hasParent()) {
                 updateParentWorkflowTask(workflow);
                 LOGGER.info(
@@ -645,6 +684,7 @@ public class WorkflowExecutor {
                 expediteLazyWorkflowEvaluation(workflow.getParentWorkflowId());
             }
 
+            // 触发失败工作流（若有配置）
             if (!StringUtils.isBlank(failureWorkflow)) {
                 Map<String, Object> input = new HashMap<>(workflow.getInput());
                 input.put("workflowId", workflowId);
@@ -685,6 +725,7 @@ public class WorkflowExecutor {
             executionDAOFacade.removeFromPendingWorkflow(
                     workflow.getWorkflowName(), workflow.getWorkflowId());
 
+            // 取消所有非终态任务
             List<String> erroredTasks = cancelNonTerminalTasks(workflow);
             if (!erroredTasks.isEmpty()) {
                 throw new NonTransientException(
@@ -700,14 +741,18 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param taskResult the task result to be updated.
-     * @throws IllegalArgumentException if the {@link TaskResult} is null.
-     * @throws NotFoundException if the Task is not found.
+     * Worker 上报任务结果的核心入口：
+     * 校验任务状态 → 更新任务 → 更新队列 → 持久化 → 触发 decide 推进工作流。
+     *
+     * @param taskResult 要更新的任务结果
+     * @throws IllegalArgumentException 如果 taskResult 为 null
+     * @throws NotFoundException 找不到任务
      */
     public void updateTask(TaskResult taskResult) {
         if (taskResult == null) {
             throw new IllegalArgumentException("Task object is null");
         } else if (taskResult.isExtendLease()) {
+            // 延长租约（长任务心跳）
             extendLease(taskResult);
             return;
         }
@@ -727,8 +772,8 @@ public class WorkflowExecutor {
 
         String taskQueueName = QueueUtils.getQueueName(task);
 
+        // 任务已终态：忽略本次更新，从队列移除
         if (task.getStatus().isTerminal()) {
-            // Task was already updated....
             queueDAO.remove(taskQueueName, taskResult.getTaskId());
             LOGGER.info(
                     "Task: {} has already finished execution with status: {} within workflow: {}. Removed task from queue: {}",
@@ -741,8 +786,8 @@ public class WorkflowExecutor {
             return;
         }
 
+        // 工作流已终态：忽略本次更新，从队列移除
         if (workflowInstance.getStatus().isTerminal()) {
-            // Workflow is in terminal state
             queueDAO.remove(taskQueueName, taskResult.getTaskId());
             LOGGER.info(
                     "Workflow: {} has already finished execution. Task update for: {} ignored and removed from Queue: {}.",
@@ -756,9 +801,7 @@ public class WorkflowExecutor {
             return;
         }
 
-        // for system tasks, setting to SCHEDULED would mean restarting the task which is
-        // undesirable
-        // for worker tasks, set status to SCHEDULED and push to the queue
+        // 系统任务不设为 SCHEDULED（避免重启系统任务）；worker 任务的 IN_PROGRESS 改为 SCHEDULED 重新入队
         if (!systemTaskRegistry.isSystemTask(task.getTaskType())
                 && taskResult.getStatus() == TaskResult.Status.IN_PROGRESS) {
             task.setStatus(SCHEDULED);
@@ -781,13 +824,14 @@ public class WorkflowExecutor {
             task.setEndTime(System.currentTimeMillis());
         }
 
-        // Update message in Task queue based on Task status
+        // 根据任务状态更新队列中的消息
         switch (task.getStatus()) {
             case COMPLETED:
             case CANCELED:
             case FAILED:
             case FAILED_WITH_TERMINAL_ERROR:
             case TIMED_OUT:
+                // 终态：从队列移除
                 try {
                     queueDAO.remove(taskQueueName, taskResult.getTaskId());
                     LOGGER.debug(
@@ -796,8 +840,7 @@ public class WorkflowExecutor {
                             taskQueueName,
                             task.getStatus().name());
                 } catch (Exception e) {
-                    // Ignore exceptions on queue remove as it wouldn't impact task and workflow
-                    // execution, and will be cleaned up eventually
+                    // 移除失败不影响任务执行，最终会被清理
                     String errorMsg =
                             String.format(
                                     "Error removing the message in queue for task: %s for workflow: %s",
@@ -809,6 +852,7 @@ public class WorkflowExecutor {
                 break;
             case IN_PROGRESS:
             case SCHEDULED:
+                // 延期任务（callbackAfterSeconds）
                 try {
                     long callBack = taskResult.getCallbackAfterSeconds();
                     queueDAO.postpone(
@@ -820,7 +864,7 @@ public class WorkflowExecutor {
                             task.getStatus().name(),
                             callBack);
                 } catch (Exception e) {
-                    // Throw exceptions on queue postpone, this would impact task execution
+                    // postpone 失败会影响任务执行，抛出 TransientException
                     String errorMsg =
                             String.format(
                                     "Error postponing the message in queue for task: %s for workflow: %s",
@@ -835,7 +879,7 @@ public class WorkflowExecutor {
                 break;
         }
 
-        // Throw a TransientException if below operations fail to avoid workflow inconsistencies.
+        // 持久化任务；失败抛 TransientException 保证一致性
         try {
             executionDAOFacade.updateTask(task);
         } catch (Exception e) {
@@ -848,6 +892,7 @@ public class WorkflowExecutor {
             throw new TransientException(errorMsg, e);
         }
 
+        // 通知任务状态监听器
         try {
             notifyTaskStatusListener(task);
         } catch (Exception e) {
@@ -858,6 +903,7 @@ public class WorkflowExecutor {
             LOGGER.error(errorMsg, e);
         }
 
+        // 写执行日志
         taskResult.getLogs().forEach(taskExecLog -> taskExecLog.setTaskId(task.getTaskId()));
         executionDAOFacade.addTaskExecLog(taskResult.getLogs());
 
@@ -870,11 +916,13 @@ public class WorkflowExecutor {
                     task.getTaskDefName(), lastDuration, false, task.getStatus());
         }
 
+        // 若非延迟评估场景，立即触发 decide 推进工作流
         if (!isLazyEvaluateWorkflow(workflowInstance.getWorkflowDefinition(), task)) {
             decide(workflowId);
         }
     }
 
+    /** 按任务状态通知对应的 TaskStatusListener 回调 */
     private void notifyTaskStatusListener(TaskModel task) {
         switch (task.getStatus()) {
             case COMPLETED:
@@ -902,6 +950,7 @@ public class WorkflowExecutor {
         }
     }
 
+    /** 延长任务租约（用于长任务心跳，避免被判定超时） */
     private void extendLease(TaskResult taskResult) {
         TaskModel task =
                 Optional.ofNullable(executionDAOFacade.getTaskModel(taskResult.getTaskId()))
@@ -931,18 +980,17 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Determines if a workflow can be lazily evaluated, if it meets any of these criteria
-     *
+     * 判断工作流是否可以延迟评估（lazy evaluate）。
+     * 满足以下条件之一返回 true：
      * <ul>
-     *   <li>The task is NOT a loop task within DO_WHILE
-     *   <li>The task is one of the intermediate tasks in a branch within a FORK_JOIN
-     *   <li>The task is forked from a FORK_JOIN_DYNAMIC
+     *   <li>任务是 DO_WHILE 中的循环任务
+     *   <li>任务是 FORK_JOIN 分支中的中间任务
+     *   <li>任务来自 FORK_JOIN_DYNAMIC
      * </ul>
      *
-     * @param workflowDef The workflow definition of the workflow for which evaluation decision is
-     *     to be made
-     * @param task The task which is attempting to trigger the evaluation
-     * @return true if workflow can be lazily evaluated, false otherwise
+     * @param workflowDef 工作流定义
+     * @param task 正在尝试触发评估的任务
+     * @return true 表示可以延迟评估
      */
     @VisibleForTesting
     boolean isLazyEvaluateWorkflow(WorkflowDef workflowDef, TaskModel task) {
@@ -972,6 +1020,7 @@ public class WorkflowExecutor {
                 && task.getStatus().isSuccessful();
     }
 
+    /** 按 taskId 获取任务（若有关联的 workflowTask 定义，则填充定义信息） */
     public TaskModel getTask(String taskId) {
         return Optional.ofNullable(executionDAOFacade.getTaskModel(taskId))
                 .map(
@@ -984,10 +1033,12 @@ public class WorkflowExecutor {
                 .orElse(null);
     }
 
+    /** 获取指定名称和版本的运行中工作流 */
     public List<Workflow> getRunningWorkflows(String workflowName, int version) {
         return executionDAOFacade.getPendingWorkflowsByName(workflowName, version);
     }
 
+    /** 按名称/版本/时间范围查询工作流 id 列表 */
     public List<String> getWorkflows(String name, Integer version, Long startTime, Long endTime) {
         return executionDAOFacade.getWorkflowsByName(name, startTime, endTime).stream()
                 .filter(workflow -> workflow.getWorkflowVersion() == version)
@@ -995,16 +1046,18 @@ public class WorkflowExecutor {
                 .collect(Collectors.toList());
     }
 
+    /** 获取运行中工作流的 id 列表 */
     public List<String> getRunningWorkflowIds(String workflowName, int version) {
         return executionDAOFacade.getRunningWorkflowIds(workflowName, version);
     }
 
+    /** 监听 WorkflowEvaluationEvent 事件，异步触发 decide */
     @EventListener(WorkflowEvaluationEvent.class)
     public void handleWorkflowEvaluationEvent(WorkflowEvaluationEvent wee) {
         decide(wee.getWorkflowModel());
     }
 
-    /** Records a metric for the "decide" process. */
+    /** 按 workflowId 评估工作流状态（加锁、记录耗时指标） */
     public WorkflowModel decide(String workflowId) {
         StopWatch watch = new StopWatch();
         watch.start();
@@ -1015,7 +1068,7 @@ public class WorkflowExecutor {
 
             WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, true);
             if (workflow == null) {
-                // This can happen if the workflowId is incorrect
+                // workflowId 不正确时可能为 null
                 return null;
             }
             return decide(workflow);
@@ -1028,11 +1081,10 @@ public class WorkflowExecutor {
     }
 
     /**
-     * This method overloads the {@link #decide(String)}. It will acquire a lock and evaluate the
-     * state of the workflow.
+     * decide 的重载：先获取锁，再评估工作流状态。
      *
-     * @param workflow the workflow to evaluate the state for
-     * @return the workflow
+     * @param workflow 要评估的工作流
+     * @return 评估后的工作流
      */
     public WorkflowModel decideWithLock(WorkflowModel workflow) {
         if (workflow == null) {
@@ -1054,10 +1106,16 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param workflow the workflow to evaluate the state for
-     * @return true if the workflow has completed (success or failed), false otherwise. Note: This
-     *     method does not acquire the lock on the workflow and should ony be called / overridden if
-     *     No locking is required or lock is acquired externally
+     * 工作流状态评估的核心方法（不加锁，由调用方负责加锁）。
+     * 流程：
+     * 1. 若工作流已终态，取消非终态任务后返回
+     * 2. 处理子工作流变化
+     * 3. 调用 DeciderService.decide 得到 outcome（完成 / 待调度任务 / 待更新任务）
+     * 4. 调度任务、更新任务、持久化
+     * 5. 若状态有变化则递归 decide 继续推进
+     *
+     * @param workflow 要评估的工作流
+     * @return 评估后的工作流
      */
     public WorkflowModel decide(WorkflowModel workflow) {
         if (workflow.getStatus().isTerminal()) {
@@ -1067,8 +1125,7 @@ public class WorkflowExecutor {
             return workflow;
         }
 
-        // we find any sub workflow tasks that have changed
-        // and change the workflow/task state accordingly
+        // 处理子工作流变化：重置标记、必要时把 JOIN 任务改回 IN_PROGRESS
         adjustStateIfSubWorkflowChanged(workflow);
 
         try {
@@ -1086,6 +1143,7 @@ public class WorkflowExecutor {
 
             boolean stateChanged = scheduleTask(workflow, tasksToBeScheduled); // start
 
+            // 对非异步系统任务，直接同步执行 start，并加入待更新列表
             for (TaskModel task : outcome.tasksToBeScheduled) {
                 executionDAOFacade.populateTaskData(task);
                 if (systemTaskRegistry.isSystemTask(task.getTaskType())
@@ -1104,6 +1162,7 @@ public class WorkflowExecutor {
                 executionDAOFacade.updateTasks(tasksToBeUpdated);
             }
 
+            // 状态有变化则递归继续 decide，直到稳定
             if (stateChanged) {
                 return decide(workflow);
             }
@@ -1115,6 +1174,7 @@ public class WorkflowExecutor {
             return workflow;
 
         } catch (TerminateWorkflowException twe) {
+            // 终止异常：直接终止工作流
             LOGGER.info("Execution terminated of workflow: {}", workflow, twe);
             terminate(workflow, twe);
             return workflow;
@@ -1124,10 +1184,14 @@ public class WorkflowExecutor {
         }
     }
 
+    /**
+     * 若工作流中有子工作流任务发生变化（subworkflowChanged=true），做相应调整：
+     * 重置标记；若定义中含 JOIN / FORK_JOIN_DYNAMIC，则把非成功的 JOIN 终态任务改回 IN_PROGRESS 并重新入队。
+     */
     private void adjustStateIfSubWorkflowChanged(WorkflowModel workflow) {
         Optional<TaskModel> changedSubWorkflowTask = findChangedSubWorkflowTask(workflow);
         if (changedSubWorkflowTask.isPresent()) {
-            // reset the flag
+            // 重置标记
             TaskModel subWorkflowTask = changedSubWorkflowTask.get();
             subWorkflowTask.setSubworkflowChanged(false);
             executionDAOFacade.updateTask(subWorkflowTask);
@@ -1137,13 +1201,10 @@ public class WorkflowExecutor {
                     workflow.toShortString(),
                     subWorkflowTask.getTaskId());
 
-            // find all terminal and unsuccessful JOIN tasks and set them to IN_PROGRESS
+            // 若定义含 JOIN 或 FORK_JOIN_DYNAMIC，把非成功的 JOIN 终态任务改回 IN_PROGRESS 重新评估
             if (workflow.getWorkflowDefinition().containsType(TaskType.TASK_TYPE_JOIN)
                     || workflow.getWorkflowDefinition()
-                            .containsType(TaskType.TASK_TYPE_FORK_JOIN_DYNAMIC)) {
-                // if we are here, then the SUB_WORKFLOW task could be part of a FORK_JOIN or
-                // FORK_JOIN_DYNAMIC
-                // and the JOIN task(s) needs to be evaluated again, set them to IN_PROGRESS
+                    .containsType(TaskType.TASK_TYPE_FORK_JOIN_DYNAMIC)) {
                 workflow.getTasks().stream()
                         .filter(UNSUCCESSFUL_JOIN_TASK)
                         .peek(
@@ -1156,6 +1217,7 @@ public class WorkflowExecutor {
         }
     }
 
+    /** 查找第一个 subworkflowChanged=true 且未重试的 SUB_WORKFLOW 任务 */
     private Optional<TaskModel> findChangedSubWorkflowTask(WorkflowModel workflow) {
         WorkflowDef workflowDef =
                 Optional.ofNullable(workflow.getWorkflowDefinition())
@@ -1171,7 +1233,7 @@ public class WorkflowExecutor {
                                                                         "Workflow Definition is not found")));
         if (workflowDef.containsType(TaskType.TASK_TYPE_SUB_WORKFLOW)
                 || workflow.getWorkflowDefinition()
-                        .containsType(TaskType.TASK_TYPE_FORK_JOIN_DYNAMIC)) {
+                .containsType(TaskType.TASK_TYPE_FORK_JOIN_DYNAMIC)) {
             return workflow.getTasks().stream()
                     .filter(
                             t ->
@@ -1183,13 +1245,17 @@ public class WorkflowExecutor {
         return Optional.empty();
     }
 
+    /**
+     * 取消所有非终态任务，并做收尾（通知监听器、从 decider 队列移除）。
+     *
+     * @return 取消失败的系统任务引用名列表
+     */
     @VisibleForTesting
     List<String> cancelNonTerminalTasks(WorkflowModel workflow) {
         List<String> erroredTasks = new ArrayList<>();
-        // Update non-terminal tasks' status to CANCELED
+        // 把所有非终态任务状态改为 CANCELED；系统任务额外调用 cancel()
         for (TaskModel task : workflow.getTasks()) {
             if (!task.getStatus().isTerminal()) {
-                // Cancel the ones which are not completed yet....
                 task.setStatus(CANCELED);
                 if (systemTaskRegistry.isSystemTask(task.getTaskType())) {
                     WorkflowSystemTask workflowSystemTask =
@@ -1223,6 +1289,12 @@ public class WorkflowExecutor {
         return erroredTasks;
     }
 
+    /**
+     * 去重并添加任务：以 (referenceTaskName + "_" + retryCount) 为唯一键，
+     * 避免同一任务被重复调度。
+     *
+     * @return 实际新增的任务列表
+     */
     @VisibleForTesting
     List<TaskModel> dedupAndAddTasks(WorkflowModel workflow, List<TaskModel> tasks) {
         Set<String> tasksInWorkflow =
@@ -1245,7 +1317,9 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @throws ConflictException if the workflow is in terminal state.
+     * 暂停工作流：状态改为 PAUSED，并从 decider 队列移除（停止被调度）。
+     *
+     * @throws ConflictException 工作流已终态
      */
     public void pauseWorkflow(String workflowId) {
         try {
@@ -1258,7 +1332,7 @@ public class WorkflowExecutor {
                         workflow.toShortString());
             }
             if (workflow.getStatus().equals(status)) {
-                return; // Already paused!
+                return; // 已暂停
             }
             workflow.setStatus(status);
             executionDAOFacade.updateWorkflow(workflow);
@@ -1266,8 +1340,7 @@ public class WorkflowExecutor {
             executionLockService.releaseLock(workflowId);
         }
 
-        // remove from the sweep queue
-        // any exceptions can be ignored, as this is not critical to the pause operation
+        // 从 decider 队列移除；失败可忽略，不影响暂停
         try {
             queueDAO.remove(DECIDER_QUEUE, workflowId);
         } catch (Exception e) {
@@ -1279,8 +1352,10 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param workflowId the workflow to be resumed
-     * @throws IllegalStateException if the workflow is not in PAUSED state
+     * 恢复工作流：状态改为 RUNNING，推入 decider 队列并触发 decide。
+     *
+     * @param workflowId 要恢复的工作流
+     * @throws IllegalStateException 工作流不处于 PAUSED 状态
      */
     public void resumeWorkflow(String workflowId) {
         WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, false);
@@ -1294,7 +1369,7 @@ public class WorkflowExecutor {
         }
         workflow.setStatus(WorkflowModel.Status.RUNNING);
         workflow.setLastRetriedTime(System.currentTimeMillis());
-        // Add to decider queue
+        // 推入 decider 队列
         queueDAO.push(
                 DECIDER_QUEUE,
                 workflow.getWorkflowId(),
@@ -1305,17 +1380,19 @@ public class WorkflowExecutor {
     }
 
     /**
-     * @param workflowId the id of the workflow
-     * @param taskReferenceName the referenceName of the task to be skipped
-     * @param skipTaskRequest the {@link SkipTaskRequest} object
-     * @throws IllegalStateException
+     * 跳过工作流中的某个任务：创建一个 SKIPPED 任务替代它，然后触发 decide。
+     *
+     * @param workflowId 工作流 id
+     * @param taskReferenceName 要跳过的任务引用名
+     * @param skipTaskRequest 跳过请求（可携带输入/输出）
+     * @throws IllegalStateException 工作流未运行、任务不存在或任务已处理
      */
     public void skipTaskFromWorkflow(
             String workflowId, String taskReferenceName, SkipTaskRequest skipTaskRequest) {
 
         WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, true);
 
-        // If the workflow is not running then cannot skip any task
+        // 工作流必须处于 RUNNING 才能跳过任务
         if (!workflow.getStatus().equals(WorkflowModel.Status.RUNNING)) {
             String errorMsg =
                     String.format(
@@ -1324,7 +1401,7 @@ public class WorkflowExecutor {
             throw new IllegalStateException(errorMsg);
         }
 
-        // Check if the reference name is as per the workflowdef
+        // 任务引用名必须存在于工作流定义中
         WorkflowTask workflowTask =
                 workflow.getWorkflowDefinition().getTaskByRefName(taskReferenceName);
         if (workflowTask == null) {
@@ -1335,7 +1412,7 @@ public class WorkflowExecutor {
             throw new IllegalStateException(errorMsg);
         }
 
-        // If the task is already started the again it cannot be skipped
+        // 若任务已经开始处理，则不能跳过
         workflow.getTasks()
                 .forEach(
                         task -> {
@@ -1348,7 +1425,7 @@ public class WorkflowExecutor {
                             }
                         });
 
-        // Now create a "SKIPPED" task for this workflow
+        // 创建 SKIPPED 任务
         TaskModel taskToBeSkipped = new TaskModel();
         taskToBeSkipped.setTaskId(idGenerator.generate());
         taskToBeSkipped.setReferenceTaskName(taskReferenceName);
@@ -1368,10 +1445,12 @@ public class WorkflowExecutor {
         decide(workflow.getWorkflowId());
     }
 
+    /** 获取工作流（可含任务） */
     public WorkflowModel getWorkflow(String workflowId, boolean includeTasks) {
         return executionDAOFacade.getWorkflowModel(workflowId, includeTasks);
     }
 
+    /** 把任务推入对应队列（带 callbackAfterSeconds 则延迟） */
     public void addTaskToQueue(TaskModel task) {
         // put in queue
         String taskQueueName = QueueUtils.getQueueName(task);
@@ -1392,25 +1471,29 @@ public class WorkflowExecutor {
                 task.getCallbackAfterSeconds());
     }
 
+    /**
+     * 根据 taskToDomain 配置设置任务的目标 domain。
+     * Step 1：应用 "*" 通配映射
+     * Step 2：应用任务类型特定的映射覆盖
+     */
     @VisibleForTesting
     void setTaskDomains(List<TaskModel> tasks, WorkflowModel workflow) {
         Map<String, String> taskToDomain = workflow.getTaskToDomain();
         if (taskToDomain != null) {
-            // Step 1: Apply * mapping to all tasks, if present.
+            // Step 1: 先应用 "*" 映射到所有任务
             String domainstr = taskToDomain.get("*");
             if (StringUtils.isNotBlank(domainstr)) {
                 String[] domains = domainstr.split(",");
                 tasks.forEach(
                         task -> {
-                            // Filter out SystemTask
+                            // 过滤系统任务
                             if (!systemTaskRegistry.isSystemTask(task.getTaskType())) {
-                                // Check which domain worker is polling
-                                // Set the task domain
+                                // 选择有活跃 worker 的 domain
                                 task.setDomain(getActiveDomain(task.getTaskType(), domains));
                             }
                         });
             }
-            // Step 2: Override additional mappings.
+            // Step 2: 应用任务类型特定映射覆盖
             tasks.forEach(
                     task -> {
                         if (!systemTaskRegistry.isSystemTask(task.getTaskType())) {
@@ -1426,15 +1509,15 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Gets the active domain from the list of domains where the task is to be queued. The domain
-     * list must be ordered. In sequence, check if any worker has polled for last
-     * `activeWorkerLastPollMs`, if so that is the Active domain. When no active domains are found:
-     * <li>If NO_DOMAIN token is provided, return null.
-     * <li>Else, return last domain from list.
+     * 从 domain 列表中选择活跃 domain：
+     * 依次检查每个 domain 是否在最近 activeWorkerLastPollMs 内有 worker poll，
+     * 找到即返回；若都没有：
+     * <li>若列表含 NO_DOMAIN 则返回 null
+     * <li>否则返回列表最后一个 domain
      *
-     * @param taskType the taskType of the task for which active domain is to be found
-     * @param domains the array of domains for the task. (Must contain atleast one element).
-     * @return the active domain where the task will be queued
+     * @param taskType 任务类型
+     * @param domains domain 数组（至少一个元素）
+     * @return 选中的活跃 domain
      */
     @VisibleForTesting
     String getActiveDomain(String taskType, String[] domains) {
@@ -1455,6 +1538,7 @@ public class WorkflowExecutor {
                                 : domains[domains.length - 1].trim());
     }
 
+    /** 递归计算任务总耗时（含被重试的前序任务） */
     private long getTaskDuration(long s, TaskModel task) {
         long duration = task.getEndTime() - task.getStartTime();
         s += duration;
@@ -1464,6 +1548,13 @@ public class WorkflowExecutor {
         return s + getTaskDuration(s, executionDAOFacade.getTaskModel(task.getRetriedTaskId()));
     }
 
+    /**
+     * 调度任务：为任务分配 seq、持久化、区分系统任务/worker 任务。
+     * - 系统任务：同步的立即 start 并更新；异步的入队
+     * - worker 任务：直接入队
+     *
+     * @return 是否有系统任务被启动
+     */
     @VisibleForTesting
     boolean scheduleTask(WorkflowModel workflow, List<TaskModel> tasks) {
         List<TaskModel> tasksToBeQueued;
@@ -1474,22 +1565,22 @@ public class WorkflowExecutor {
                 return false;
             }
 
-            // Get the highest seq number
+            // 取当前最大 seq
             int count = workflow.getTasks().stream().mapToInt(TaskModel::getSeq).max().orElse(0);
 
             for (TaskModel task : tasks) {
-                if (task.getSeq() == 0) { // Set only if the seq was not set
+                if (task.getSeq() == 0) { // 仅当 seq 未设置时才分配
                     task.setSeq(++count);
                 }
             }
 
-            // metric to track the distribution of number of tasks within a workflow
+            // 记录工作流内任务数分布指标
             Monitors.recordNumTasksInWorkflow(
                     workflow.getTasks().size() + tasks.size(),
                     workflow.getWorkflowName(),
                     String.valueOf(workflow.getWorkflowVersion()));
 
-            // Save the tasks in the DAO
+            // 持久化任务
             executionDAOFacade.createTasks(tasks);
 
             List<TaskModel> systemTasks =
@@ -1502,8 +1593,7 @@ public class WorkflowExecutor {
                             .filter(task -> !systemTaskRegistry.isSystemTask(task.getTaskType()))
                             .collect(Collectors.toList());
 
-            // Traverse through all the system tasks, start the sync tasks, in case of async queue
-            // the tasks
+            // 遍历系统任务：同步的立即 start，异步的入队
             for (TaskModel task : systemTasks) {
                 WorkflowSystemTask workflowSystemTask = systemTaskRegistry.get(task.getTaskType());
                 if (workflowSystemTask == null) {
@@ -1517,7 +1607,7 @@ public class WorkflowExecutor {
                 }
                 if (!workflowSystemTask.isAsync()) {
                     try {
-                        // start execution of synchronous system tasks
+                        // 启动同步系统任务
                         workflowSystemTask.start(workflow, task, this);
                     } catch (Exception e) {
                         String errorMsg =
@@ -1547,8 +1637,7 @@ public class WorkflowExecutor {
             throw new TerminateWorkflowException(errorMsg);
         }
 
-        // On addTaskToQueue failures, ignore the exceptions and let WorkflowRepairService take care
-        // of republishing the messages to the queue.
+        // 入队失败时忽略异常，交由 WorkflowRepairService 后续补发
         try {
             addTaskToQueue(tasksToBeQueued);
         } catch (Exception e) {
@@ -1564,10 +1653,11 @@ public class WorkflowExecutor {
         return startedSystemTasks;
     }
 
+    /** 批量入队，并通知 TaskStatusListener.onTaskScheduled */
     private void addTaskToQueue(final List<TaskModel> tasks) {
         for (TaskModel task : tasks) {
             addTaskToQueue(task);
-            // notify TaskStatusListener
+            // 通知 TaskStatusListener
             try {
                 taskStatusListener.onTaskScheduled(task);
             } catch (Exception e) {
@@ -1580,6 +1670,7 @@ public class WorkflowExecutor {
         }
     }
 
+    /** 终止工作流内部实现：设置状态、记录失败任务、触发失败工作流 */
     private WorkflowModel terminate(
             final WorkflowModel workflow, TerminateWorkflowException terminateWorkflowException) {
         if (!workflow.getStatus().isTerminal()) {
@@ -1593,6 +1684,7 @@ public class WorkflowExecutor {
         String failureWorkflow = workflow.getWorkflowDefinition().getFailureWorkflow();
         if (failureWorkflow != null) {
             if (failureWorkflow.startsWith("$")) {
+                // 支持从输入参数中动态解析失败工作流名
                 String[] paramPathComponents = failureWorkflow.split("\\.");
                 String name = paramPathComponents[2]; // name of the input parameter
                 failureWorkflow = (String) workflow.getInput().get(name);
@@ -1605,6 +1697,13 @@ public class WorkflowExecutor {
                 workflow, terminateWorkflowException.getMessage(), failureWorkflow);
     }
 
+    /**
+     * 重跑工作流的核心实现：
+     * - taskId 为 null：重跑整个工作流（清空所有任务）
+     * - taskId 非 null：从指定任务开始重跑（删除该任务之后的所有任务）
+     *
+     * @return 是否成功找到并重跑
+     */
     private boolean rerunWF(
             String workflowId,
             String taskId,
@@ -1612,7 +1711,7 @@ public class WorkflowExecutor {
             Map<String, Object> workflowInput,
             String correlationId) {
 
-        // Get the workflow
+        // 获取工作流
         WorkflowModel workflow = executionDAOFacade.getWorkflowModel(workflowId, true);
         if (!workflow.getStatus().isTerminal()) {
             String errorMsg =
@@ -1623,14 +1722,14 @@ public class WorkflowExecutor {
         }
         updateAndPushParents(workflow, "reran");
 
-        // If the task Id is null it implies that the entire workflow has to be rerun
+        // taskId 为 null：重跑整个工作流
         if (taskId == null) {
-            // remove all tasks
+            // 移除所有任务
             workflow.getTasks().forEach(task -> executionDAOFacade.removeTask(task.getTaskId()));
             workflow.setTasks(new ArrayList<>());
-            // Set workflow as RUNNING
+            // 状态设为 RUNNING
             workflow.setStatus(WorkflowModel.Status.RUNNING);
-            // Reset failure reason from previous run to default
+            // 重置失败信息
             workflow.setReasonForIncompletion(null);
             workflow.setFailedTaskId(null);
             workflow.setFailedReferenceTaskNames(new HashSet<>());
@@ -1654,7 +1753,7 @@ public class WorkflowExecutor {
             return true;
         }
 
-        // Now iterate through the tasks and find the "specific" task
+        // 查找指定任务
         TaskModel rerunFromTask = null;
         for (TaskModel task : workflow.getTasks()) {
             if (task.getTaskId().equals(taskId)) {
@@ -1663,7 +1762,7 @@ public class WorkflowExecutor {
             }
         }
 
-        // If not found look into sub workflows
+        // 若当前工作流找不到，尝试在子工作流中递归查找
         if (rerunFromTask == null) {
             for (TaskModel task : workflow.getTasks()) {
                 if (task.getTaskType().equalsIgnoreCase(TaskType.TASK_TYPE_SUB_WORKFLOW)) {
@@ -1677,9 +1776,9 @@ public class WorkflowExecutor {
         }
 
         if (rerunFromTask != null) {
-            // set workflow as RUNNING
+            // 状态设为 RUNNING
             workflow.setStatus(WorkflowModel.Status.RUNNING);
-            // Reset failure reason from previous run to default
+            // 重置失败信息
             workflow.setReasonForIncompletion(null);
             workflow.setFailedTaskId(null);
             workflow.setFailedReferenceTaskNames(new HashSet<>());
@@ -1691,17 +1790,16 @@ public class WorkflowExecutor {
             if (workflowInput != null) {
                 workflow.setInput(workflowInput);
             }
-            // Add to decider queue
+            // 推入 decider 队列
             queueDAO.push(
                     DECIDER_QUEUE,
                     workflow.getWorkflowId(),
                     workflow.getPriority(),
                     properties.getWorkflowOffsetTimeout().getSeconds());
             executionDAOFacade.updateWorkflow(workflow);
-            // update tasks in datastore to update workflow-tasks relationship for archived
-            // workflows
+            // 更新任务以修复 workflow-tasks 关系（归档工作流场景）
             executionDAOFacade.updateTasks(workflow.getTasks());
-            // Remove all tasks after the "rerunFromTask"
+            // 移除 rerunFromTask 之后的所有任务
             List<TaskModel> filteredTasks = new ArrayList<>();
             for (TaskModel task : workflow.getTasks()) {
                 if (task.getSeq() > rerunFromTask.getSeq()) {
@@ -1711,7 +1809,7 @@ public class WorkflowExecutor {
                 }
             }
             workflow.setTasks(filteredTasks);
-            // reset fields before restarting the task
+            // 重置任务字段
             rerunFromTask.setScheduledTime(System.currentTimeMillis());
             rerunFromTask.setStartTime(0);
             rerunFromTask.setUpdateTime(0);
@@ -1720,7 +1818,7 @@ public class WorkflowExecutor {
             rerunFromTask.setRetried(false);
             rerunFromTask.setExecuted(false);
             if (rerunFromTask.getTaskType().equalsIgnoreCase(TaskType.TASK_TYPE_SUB_WORKFLOW)) {
-                // if task is sub workflow set task as IN_PROGRESS and reset start time
+                // 子工作流任务：置为 IN_PROGRESS 并重置开始时间
                 rerunFromTask.setStatus(IN_PROGRESS);
                 rerunFromTask.setStartTime(System.currentTimeMillis());
             } else {
@@ -1729,12 +1827,12 @@ public class WorkflowExecutor {
                 }
                 if (systemTaskRegistry.isSystemTask(rerunFromTask.getTaskType())
                         && !systemTaskRegistry.get(rerunFromTask.getTaskType()).isAsync()) {
-                    // Start the synchronous system task directly
+                    // 同步系统任务：直接 start
                     systemTaskRegistry
                             .get(rerunFromTask.getTaskType())
                             .start(workflow, rerunFromTask, this);
                 } else {
-                    // Set the task to rerun as SCHEDULED
+                    // 其他任务：置为 SCHEDULED 并入队
                     rerunFromTask.setStatus(SCHEDULED);
                     addTaskToQueue(rerunFromTask);
                 }
@@ -1746,9 +1844,12 @@ public class WorkflowExecutor {
         return false;
     }
 
+    /**
+     * 为 DO_WHILE 循环任务调度下一次迭代：
+     * 只调度第一次循环任务，后续由 DeciderService 在任务完成后接管。
+     */
     public void scheduleNextIteration(TaskModel loopTask, WorkflowModel workflow) {
-        // Schedule only first loop over task. Rest will be taken care in Decider Service when this
-        // task will get completed.
+        // 只调度第一次循环任务，后续由 DeciderService 在任务完成后处理
         List<TaskModel> scheduledLoopOverTasks =
                 deciderService.getTasksToBeScheduled(
                         workflow,
@@ -1767,6 +1868,7 @@ public class WorkflowExecutor {
         workflow.getTasks().addAll(scheduledLoopOverTasks);
     }
 
+    /** 获取任务定义；找不到则抛 TerminateWorkflowException */
     public TaskDef getTaskDefinition(TaskModel task) {
         return task.getTaskDefinition()
                 .orElseGet(
@@ -1785,6 +1887,7 @@ public class WorkflowExecutor {
                                                 }));
     }
 
+    /** 更新父工作流中的子工作流任务（同步执行结果） */
     @VisibleForTesting
     void updateParentWorkflowTask(WorkflowModel subWorkflow) {
         TaskModel subWorkflowTask =
@@ -1793,6 +1896,7 @@ public class WorkflowExecutor {
         executionDAOFacade.updateTask(subWorkflowTask);
     }
 
+    /** 执行 SUB_WORKFLOW 系统任务，把子工作流结果同步到父任务 */
     private void executeSubworkflowTaskAndSyncData(
             WorkflowModel subWorkflow, TaskModel subWorkflowTask) {
         WorkflowSystemTask subWorkflowSystemTask =
@@ -1801,9 +1905,10 @@ public class WorkflowExecutor {
     }
 
     /**
-     * Pushes workflow id into the decider queue with a higher priority to expedite evaluation.
+     * 把工作流 id 以更高优先级推入 decider 队列，加速评估。
+     * 若队列中已有该消息，则用 postpone 提升优先级。
      *
-     * @param workflowId The workflow to be evaluated at higher priority
+     * @param workflowId 需要加速评估的工作流
      */
     private void expediteLazyWorkflowEvaluation(String workflowId) {
         if (queueDAO.containsMessage(DECIDER_QUEUE, workflowId)) {

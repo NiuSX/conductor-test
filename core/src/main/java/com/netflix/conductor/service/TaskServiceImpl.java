@@ -37,6 +37,19 @@ import com.netflix.conductor.core.utils.QueueUtils;
 import com.netflix.conductor.dao.QueueDAO;
 import com.netflix.conductor.metrics.Monitors;
 
+/**
+ * TaskService 的实现类：面向 Worker 的任务交互门面。
+ *
+ * 它是薄封装 + 委托：
+ * - 大部分方法委托给 ExecutionService
+ * - 队列详情查询直接委托 QueueDAO
+ *
+ * 唯一有实质逻辑的是 ackTaskReceived：当 ack 失败时，
+ * 把任务标记为 FAILED，让 decide 重新评估工作流，避免工作流卡住。
+ *
+ * @Audit 记录审计日志
+ * @Trace 记录调用链追踪
+ */
 @Audit
 @Trace
 @Service
@@ -51,13 +64,12 @@ public class TaskServiceImpl implements TaskService {
         this.queueDAO = queueDAO;
     }
 
+    // ==================== 任务拉取 ====================
+
     /**
-     * Poll for a task of a certain type.
-     *
-     * @param taskType Task name
-     * @param workerId id of the workflow
-     * @param domain Domain of the workflow
-     * @return polled {@link Task}
+     * 拉取单个任务。
+     * 委托给 executionService.getLastPollTask（内部用 100ms 短轮询）。
+     * 记录 poll 计数指标。
      */
     public Task poll(String taskType, String workerId, String domain) {
         LOGGER.debug("Task being polled: /tasks/poll/{}?{}&{}", taskType, workerId, domain);
@@ -75,14 +87,8 @@ public class TaskServiceImpl implements TaskService {
     }
 
     /**
-     * Batch Poll for a task of a certain type.
-     *
-     * @param taskType Task Name
-     * @param workerId id of the workflow
-     * @param domain Domain of the workflow
-     * @param count Number of tasks
-     * @param timeout Timeout for polling in milliseconds
-     * @return list of {@link Task}
+     * 批量拉取任务。
+     * 委托给 executionService.poll，并记录拉取到的任务数指标。
      */
     public List<Task> batchPoll(
             String taskType, String workerId, String domain, Integer count, Integer timeout) {
@@ -97,34 +103,32 @@ public class TaskServiceImpl implements TaskService {
         return polledTasks;
     }
 
-    /**
-     * Get in progress tasks. The results are paginated.
-     *
-     * @param taskType Task Name
-     * @param startKey Start index of pagination
-     * @param count Number of entries
-     * @return list of {@link Task}
-     */
+    // ==================== 任务查询 ====================
+
+    /** 分页查询进行中的任务 */
     public List<Task> getTasks(String taskType, String startKey, Integer count) {
         return executionService.getTasks(taskType, startKey, count);
     }
 
     /**
-     * Get in progress task for a given workflow id.
-     *
-     * @param workflowId id of the workflow
-     * @param taskReferenceName Task reference name.
-     * @return instance of {@link Task}
+     * 查询指定工作流中某引用名的待处理任务。
+     * 注意：这里把参数顺序调整为 (workflowId, taskReferenceName) 后再传给 ExecutionService
+     * （ExecutionService 的签名是 (taskReferenceName, workflowId)）。
      */
     public Task getPendingTaskForWorkflow(String workflowId, String taskReferenceName) {
         return executionService.getPendingTaskForWorkflow(taskReferenceName, workflowId);
     }
 
+    /** 按 taskId 查询任务 */
+    public Task getTask(String taskId) {
+        return executionService.getTask(taskId);
+    }
+
+    // ==================== 任务更新 ====================
+
     /**
-     * Updates a task.
-     *
-     * @param taskResult Instance of {@link TaskResult}
-     * @return task Id of the updated task.
+     * 更新任务结果（Worker 上报）。
+     * 委托给 executionService.updateTask，返回被更新任务的 id。
      */
     public String updateTask(TaskResult taskResult) {
         LOGGER.debug(
@@ -139,23 +143,25 @@ public class TaskServiceImpl implements TaskService {
         return taskResult.getTaskId();
     }
 
-    /**
-     * Ack Task is received.
-     *
-     * @param taskId id of the task
-     * @param workerId id of the worker
-     * @return `true|false` if task is received or not
-     */
+    // ==================== 任务确认（含容错）====================
+
+    /** ack 任务（带 workerId），返回字符串形式的确认结果 */
     public String ackTaskReceived(String taskId, String workerId) {
         LOGGER.debug("Ack received for task: {} from worker: {}", taskId, workerId);
         return String.valueOf(ackTaskReceived(taskId));
     }
 
     /**
-     * Ack Task is received.
+     * ack 任务（核心逻辑）。
      *
-     * @param taskId id of the task
-     * @return `true|false` if task is received or not
+     * 正常情况：委托 executionService.ackTaskReceived。
+     * 异常情况（关键容错）：
+     * - 记录错误日志
+     * - 把任务标记为 FAILED（failTask）
+     * - 返回 false
+     *
+     * 目的：ack 失败时不让工作流卡住，而是让 decide 重新评估工作流。
+     * 这是"至少一次投递 + 幂等"设计的一部分——宁可失败重试，也不静默卡住。
      */
     public boolean ackTaskReceived(String taskId) {
         LOGGER.debug("Ack received for task: {}", taskId);
@@ -163,8 +169,7 @@ public class TaskServiceImpl implements TaskService {
         try {
             ackResult.set(executionService.ackTaskReceived(taskId));
         } catch (Exception e) {
-            // Fail the task and let decide reevaluate the workflow, thereby preventing workflow
-            // being stuck from transient ack errors.
+            // ack 失败时把任务标记为 FAILED，让 decide 重新评估工作流，避免工作流卡住
             String errorMsg = String.format("Error when trying to ack task %s", taskId);
             LOGGER.error(errorMsg, e);
             Task task = executionService.getTask(taskId);
@@ -175,7 +180,10 @@ public class TaskServiceImpl implements TaskService {
         return ackResult.get();
     }
 
-    /** Updates the task with FAILED status; On exception, fails the workflow. */
+    /**
+     * 把任务标记为 FAILED。
+     * 若更新任务也失败，则终止整个工作流（兜底，避免工作流永久卡住）。
+     */
     private void failTask(Task task, String errorMsg) {
         try {
             TaskResult taskResult = new TaskResult();
@@ -185,6 +193,7 @@ public class TaskServiceImpl implements TaskService {
             taskResult.setReasonForIncompletion(errorMsg);
             executionService.updateTask(taskResult);
         } catch (Exception e) {
+            // 连标记失败都做不到，只能终止工作流兜底
             LOGGER.error(
                     "Unable to fail task: {} in workflow: {}",
                     task.getTaskId(),
@@ -195,65 +204,40 @@ public class TaskServiceImpl implements TaskService {
         }
     }
 
-    /**
-     * Log Task Execution Details.
-     *
-     * @param taskId id of the task
-     * @param log Details you want to log
-     */
+    // ==================== 任务日志 ====================
+
+    /** 记录任务执行日志 */
     public void log(String taskId, String log) {
         executionService.log(taskId, log);
     }
 
-    /**
-     * Get Task Execution Logs.
-     *
-     * @param taskId id of the task.
-     * @return list of {@link TaskExecLog}
-     */
+    /** 获取任务执行日志 */
     public List<TaskExecLog> getTaskLogs(String taskId) {
         return executionService.getTaskLogs(taskId);
     }
 
-    /**
-     * Get task by Id.
-     *
-     * @param taskId id of the task.
-     * @return instance of {@link Task}
-     */
-    public Task getTask(String taskId) {
-        return executionService.getTask(taskId);
-    }
+    // ==================== 队列管理 ====================
 
-    /**
-     * Remove Task from a Task type queue.
-     *
-     * @param taskType Task Name
-     * @param taskId ID of the task
-     */
+    /** 从队列移除任务（带 taskType 参数，但实际只用 taskId） */
     public void removeTaskFromQueue(String taskType, String taskId) {
         executionService.removeTaskFromQueue(taskId);
     }
 
-    /**
-     * Remove Task from a Task type queue.
-     *
-     * @param taskId ID of the task
-     */
+    /** 从队列移除任务 */
     public void removeTaskFromQueue(String taskId) {
         executionService.removeTaskFromQueue(taskId);
     }
 
-    /**
-     * Get Task type queue sizes.
-     *
-     * @param taskTypes List of task types.
-     * @return map of task type as Key and queue size as value.
-     */
+    /** 批量查询任务类型队列大小 */
     public Map<String, Integer> getTaskQueueSizes(List<String> taskTypes) {
         return executionService.getTaskQueueSizes(taskTypes);
     }
 
+    /**
+     * 查询指定任务类型的队列大小。
+     * 这里需要先根据 taskType + domain + isolationGroupId + executionNamespace
+     * 组装出实际的队列名，再查询。
+     */
     @Override
     public Integer getTaskQueueSize(
             String taskType, String domain, String isolationGroupId, String executionNamespace) {
@@ -267,19 +251,14 @@ public class TaskServiceImpl implements TaskService {
         return executionService.getTaskQueueSize(queueName);
     }
 
-    /**
-     * Get the details about each queue.
-     *
-     * @return map of queue details.
-     */
+    /** 查询每个队列的详细信息（verbose），直接委托 QueueDAO */
     public Map<String, Map<String, Map<String, Long>>> allVerbose() {
         return queueDAO.queuesDetailVerbose();
     }
 
     /**
-     * Get the details about each queue.
-     *
-     * @return map of details about each queue.
+     * 查询每个队列的详情（简版）。
+     * 按队列名排序后收集为 LinkedHashMap，保证返回顺序稳定。
      */
     public Map<String, Long> getAllQueueDetails() {
         return queueDAO.queuesDetail().entrySet().stream()
@@ -292,76 +271,42 @@ public class TaskServiceImpl implements TaskService {
                                 LinkedHashMap::new));
     }
 
-    /**
-     * Get the last poll data for a given task type.
-     *
-     * @param taskType Task Name
-     * @return list of {@link PollData}
-     */
+    // ==================== Poll 数据 ====================
+
+    /** 查询指定任务类型的 poll 数据 */
     public List<PollData> getPollData(String taskType) {
         return executionService.getPollData(taskType);
     }
 
-    /**
-     * Get the last poll data for all task types.
-     *
-     * @return list of {@link PollData}
-     */
+    /** 查询所有任务类型的 poll 数据 */
     public List<PollData> getAllPollData() {
         return executionService.getAllPollData();
     }
 
-    /**
-     * Requeue pending tasks.
-     *
-     * @param taskType Task name.
-     * @return number of tasks requeued.
-     */
+    // ==================== 重新入队 ====================
+
+    /** 重新入队待处理任务，返回入队任务数（字符串形式） */
     public String requeuePendingTask(String taskType) {
         return String.valueOf(executionService.requeuePendingTasks(taskType));
     }
 
-    /**
-     * Search for tasks based in payload and other parameters. Use sort options as ASC or DESC e.g.
-     * sort=name or sort=workflowId. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    // ==================== 搜索 ====================
+
+    /** 搜索任务摘要 */
     public SearchResult<TaskSummary> search(
             int start, int size, String sort, String freeText, String query) {
         return executionService.getSearchTasks(query, freeText, start, size, sort);
     }
 
-    /**
-     * Search for tasks based in payload and other parameters. Use sort options as ASC or DESC e.g.
-     * sort=name or sort=workflowId. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
-     */
+    /** 搜索任务完整版 V2 */
     public SearchResult<Task> searchV2(
             int start, int size, String sort, String freeText, String query) {
         return executionService.getSearchTasksV2(query, freeText, start, size, sort);
     }
 
-    /**
-     * Get the external storage location where the task output payload is stored/to be stored
-     *
-     * @param path the path for which the external storage location is to be populated
-     * @param operation the operation to be performed (read or write)
-     * @param type the type of payload (input or output)
-     * @return {@link ExternalStorageLocation} containing the uri and the path to the payload is
-     *     stored in external storage
-     */
+    // ==================== 外部存储 ====================
+
+    /** 获取任务输出 payload 的外部存储位置 */
     public ExternalStorageLocation getExternalStorageLocation(
             String path, String operation, String type) {
         return executionService.getExternalStorageLocation(path, operation, type);

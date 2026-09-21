@@ -29,16 +29,32 @@ import com.netflix.conductor.common.run.ExternalStorageLocation;
 import com.netflix.conductor.common.run.SearchResult;
 import com.netflix.conductor.common.run.TaskSummary;
 
+/**
+ * 任务服务接口：定义 Worker 与任务交互的对外 API 契约。
+ *
+ * 它是"任务执行侧"的门面接口，主要面向 Worker：
+ * - poll / batchPoll：Worker 拉取任务
+ * - updateTask：Worker 上报任务结果
+ * - ackTaskReceived：确认收到任务
+ * - log / getTaskLogs：任务日志
+ * - 队列管理、poll 数据、搜索
+ *
+ * 与 WorkflowService 的分工：
+ * - WorkflowService：管理工作流实例（启动、暂停、重试等）
+ * - TaskService（本接口）：管理任务的执行交互
+ *
+ * 实现上，它通常委托给 ExecutionService。
+ */
 @Validated
 public interface TaskService {
 
     /**
-     * Poll for a task of a certain type.
+     * 拉取一个指定类型的任务（单条）。
      *
-     * @param taskType Task name
-     * @param workerId Id of the workflow
-     * @param domain Domain of the workflow
-     * @return polled {@link Task}
+     * @param taskType 任务名称
+     * @param workerId Worker id
+     * @param domain 目标 domain
+     * @return 拉取到的任务
      */
     Task poll(
             @NotEmpty(message = "TaskType cannot be null or empty.") String taskType,
@@ -46,14 +62,14 @@ public interface TaskService {
             String domain);
 
     /**
-     * Batch Poll for a task of a certain type.
+     * 批量拉取指定类型的任务。
      *
-     * @param taskType Task Name
-     * @param workerId Id of the workflow
-     * @param domain Domain of the workflow
-     * @param count Number of tasks
-     * @param timeout Timeout for polling in milliseconds
-     * @return list of {@link Task}
+     * @param taskType 任务名称
+     * @param workerId Worker id
+     * @param domain 目标 domain
+     * @param count 期望拉取数量
+     * @param timeout 长轮询超时（毫秒）
+     * @return 任务列表
      */
     List<Task> batchPoll(
             @NotEmpty(message = "TaskType cannot be null or empty.") String taskType,
@@ -63,12 +79,12 @@ public interface TaskService {
             Integer timeout);
 
     /**
-     * Get in progress tasks. The results are paginated.
+     * 分页查询进行中的任务。
      *
-     * @param taskType Task Name
-     * @param startKey Start index of pagination
-     * @param count Number of entries
-     * @return list of {@link Task}
+     * @param taskType 任务名称
+     * @param startKey 分页起始 key
+     * @param count 返回条数
+     * @return 任务列表
      */
     List<Task> getTasks(
             @NotEmpty(message = "TaskType cannot be null or empty.") String taskType,
@@ -76,177 +92,165 @@ public interface TaskService {
             Integer count);
 
     /**
-     * Get in progress task for a given workflow id.
+     * 查询指定工作流中某引用名的待处理任务。
      *
-     * @param workflowId Id of the workflow
-     * @param taskReferenceName Task reference name.
-     * @return instance of {@link Task}
+     * @param workflowId 工作流 id
+     * @param taskReferenceName 任务引用名
+     * @return 任务实例
      */
     Task getPendingTaskForWorkflow(
             @NotEmpty(message = "WorkflowId cannot be null or empty.") String workflowId,
             @NotEmpty(message = "TaskReferenceName cannot be null or empty.")
-                    String taskReferenceName);
+            String taskReferenceName);
 
     /**
-     * Updates a task.
+     * 更新任务结果（Worker 上报执行结果）。
      *
-     * @param taskResult Instance of {@link TaskResult}
-     * @return task Id of the updated task.
+     * @param taskResult 任务结果
+     * @return 被更新任务的 id
      */
     String updateTask(
             @NotNull(message = "TaskResult cannot be null or empty.") @Valid TaskResult taskResult);
 
     /**
-     * Ack Task is received.
+     * 确认任务已收到（带 workerId）。
      *
-     * @param taskId Id of the task
-     * @param workerId Id of the worker
-     * @return `true|false` if task if received or not
+     * @param taskId 任务 id
+     * @param workerId Worker id
+     * @return 确认结果的字符串表示
      */
     String ackTaskReceived(
             @NotEmpty(message = "TaskId cannot be null or empty.") String taskId, String workerId);
 
     /**
-     * Ack Task is received.
+     * 确认任务已收到。
      *
-     * @param taskId Id of the task
-     * @return `true|false` if task if received or not
+     * @param taskId 任务 id
+     * @return 是否成功确认
      */
     boolean ackTaskReceived(@NotEmpty(message = "TaskId cannot be null or empty.") String taskId);
 
     /**
-     * Log Task Execution Details.
+     * 记录任务执行日志。
      *
-     * @param taskId Id of the task
-     * @param log Details you want to log
+     * @param taskId 任务 id
+     * @param log 日志内容
      */
     void log(@NotEmpty(message = "TaskId cannot be null or empty.") String taskId, String log);
 
     /**
-     * Get Task Execution Logs.
+     * 获取任务执行日志。
      *
-     * @param taskId Id of the task.
-     * @return list of {@link TaskExecLog}
+     * @param taskId 任务 id
+     * @return 日志列表
      */
     List<TaskExecLog> getTaskLogs(
             @NotEmpty(message = "TaskId cannot be null or empty.") String taskId);
 
     /**
-     * Get task by Id.
+     * 按 taskId 查询任务。
      *
-     * @param taskId Id of the task.
-     * @return instance of {@link Task}
+     * @param taskId 任务 id
+     * @return 任务实例
      */
     Task getTask(@NotEmpty(message = "TaskId cannot be null or empty.") String taskId);
 
     /**
-     * Remove Task from a Task type queue.
+     * 从任务类型队列中移除任务（带 taskType）。
      *
-     * @param taskType Task Name
-     * @param taskId ID of the task
+     * @param taskType 任务名称
+     * @param taskId 任务 id
      */
     void removeTaskFromQueue(
             @NotEmpty(message = "TaskType cannot be null or empty.") String taskType,
             @NotEmpty(message = "TaskId cannot be null or empty.") String taskId);
 
     /**
-     * Remove Task from a Task type queue.
+     * 从任务类型队列中移除任务（仅 taskId）。
      *
-     * @param taskId ID of the task
+     * @param taskId 任务 id
      */
     void removeTaskFromQueue(@NotEmpty(message = "TaskId cannot be null or empty.") String taskId);
 
     /**
-     * Get Task type queue sizes.
+     * 批量查询任务类型队列大小。
      *
-     * @param taskTypes List of task types.
-     * @return map of task type as Key and queue size as value.
+     * @param taskTypes 任务类型列表
+     * @return 任务类型 → 队列大小
      */
     Map<String, Integer> getTaskQueueSizes(List<String> taskTypes);
 
     /**
-     * Get the queue size for a Task Type. The input can optionally include <code>domain</code>,
-     * <code>isolationGroupId</code> and <code>executionNamespace</code>.
-     *
-     * @return
+     * 查询指定任务类型的队列大小（可带 domain、isolationGroupId、executionNamespace）。
      */
     Integer getTaskQueueSize(
             String taskType, String domain, String isolationGroupId, String executionNamespace);
 
     /**
-     * Get the details about each queue.
+     * 查询每个队列的详细信息（verbose）。
      *
-     * @return map of queue details.
+     * @return 队列详情
      */
     Map<String, Map<String, Map<String, Long>>> allVerbose();
 
     /**
-     * Get the details about each queue.
+     * 查询每个队列的详情（简版）。
      *
-     * @return map of details about each queue.
+     * @return 队列详情
      */
     Map<String, Long> getAllQueueDetails();
 
     /**
-     * Get the last poll data for a given task type.
+     * 查询指定任务类型的最后 poll 数据。
      *
-     * @param taskType Task Name
-     * @return list of {@link PollData}
+     * @param taskType 任务名称
+     * @return poll 数据列表
      */
     List<PollData> getPollData(
             @NotEmpty(message = "TaskType cannot be null or empty.") String taskType);
 
     /**
-     * Get the last poll data for all task types.
+     * 查询所有任务类型的最后 poll 数据。
      *
-     * @return list of {@link PollData}
+     * @return poll 数据列表
      */
     List<PollData> getAllPollData();
 
     /**
-     * Requeue pending tasks.
+     * 重新入队待处理任务。
      *
-     * @param taskType Task name.
-     * @return number of tasks requeued.
+     * @param taskType 任务名称
+     * @return 重新入队的任务数（字符串形式）
      */
     String requeuePendingTask(
             @NotEmpty(message = "TaskType cannot be null or empty.") String taskType);
 
     /**
-     * Search for tasks based in payload and other parameters. Use sort options as ASC or DESC e.g.
-     * sort=name or sort=workflowId. If order is not specified, defaults to ASC.
+     * 按 payload 和参数搜索任务（摘要版）。sort 支持 ASC/DESC，如 sort=name 或 sort=workflowId。
      *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
+     * @param start 分页起始
+     * @param size 返回条数
+     * @param sort 排序
+     * @param freeText 全文搜索
+     * @param query 结构化查询
+     * @return 搜索结果
      */
     SearchResult<TaskSummary> search(
             int start, int size, String sort, String freeText, String query);
 
     /**
-     * Search for tasks based in payload and other parameters. Use sort options as ASC or DESC e.g.
-     * sort=name or sort=workflowId. If order is not specified, defaults to ASC.
-     *
-     * @param start Start index of pagination
-     * @param size Number of entries
-     * @param sort Sorting type ASC|DESC
-     * @param freeText Text you want to search
-     * @param query Query you want to search
-     * @return instance of {@link SearchResult}
+     * 按 payload 和参数搜索任务（完整版 V2）。
+     * 参数含义同 search。
      */
     SearchResult<Task> searchV2(int start, int size, String sort, String freeText, String query);
 
     /**
-     * Get the external storage location where the task output payload is stored/to be stored
+     * 获取任务输出 payload 的外部存储位置。
      *
-     * @param path the path for which the external storage location is to be populated
-     * @param operation the operation to be performed (read or write)
-     * @param payloadType the type of payload (input or output)
-     * @return {@link ExternalStorageLocation} containing the uri and the path to the payload is
-     *     stored in external storage
+     * @param path 路径
+     * @param operation 操作（read / write）
+     * @param payloadType payload 类型（input / output）
+     * @return 外部存储位置
      */
     ExternalStorageLocation getExternalStorageLocation(
             String path, String operation, String payloadType);
