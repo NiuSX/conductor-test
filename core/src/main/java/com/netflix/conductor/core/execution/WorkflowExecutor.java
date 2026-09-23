@@ -1118,67 +1118,99 @@ public class WorkflowExecutor {
      * @return 评估后的工作流
      */
     public WorkflowModel decide(WorkflowModel workflow) {
+        // 如果工作流已经处于终态（如 COMPLETED、FAILED、TERMINATED 等），则不再继续决策
         if (workflow.getStatus().isTerminal()) {
+            // 如果终态不是“成功”状态，则需要取消所有尚未进入终态的任务
             if (!workflow.getStatus().isSuccessful()) {
                 cancelNonTerminalTasks(workflow);
             }
+            // 终态工作流直接返回，无需后续处理
             return workflow;
         }
 
-        // 处理子工作流变化：重置标记、必要时把 JOIN 任务改回 IN_PROGRESS
+        // 处理子工作流变化：重置相关标记，必要时把 JOIN 任务改回 IN_PROGRESS
+        // 例如子工作流状态发生变化时，可能需要重新评估父工作流中 JOIN 任务的聚合条件
         adjustStateIfSubWorkflowChanged(workflow);
 
         try {
+            // 调用决策服务，根据当前工作流状态计算出下一步需要做什么
             DeciderService.DeciderOutcome outcome = deciderService.decide(workflow);
+
+            // 如果决策结果表明工作流已经可以结束（所有任务完成或满足终止条件）
             if (outcome.isComplete) {
+                // 结束整个工作流执行，terminateTask 表示导致结束的那个任务（可能为 null）
                 endExecution(workflow, outcome.terminateTask);
                 return workflow;
             }
 
+            // 获取本次决策中需要被调度的任务列表
             List<TaskModel> tasksToBeScheduled = outcome.tasksToBeScheduled;
+            // 为这些待调度任务设置所属的 domain（用于任务分发/路由）
             setTaskDomains(tasksToBeScheduled, workflow);
+
+            // 获取本次决策中需要被更新的任务列表
             List<TaskModel> tasksToBeUpdated = outcome.tasksToBeUpdated;
 
+            // 对待调度任务进行去重，并把真正新增的任务加入工作流
             tasksToBeScheduled = dedupAndAddTasks(workflow, tasksToBeScheduled);
 
+            // 调度（启动）这些任务；返回 true 表示工作流状态发生了变化
             boolean stateChanged = scheduleTask(workflow, tasksToBeScheduled); // start
 
-            // 对非异步系统任务，直接同步执行 start，并加入待更新列表
+            // 对非异步的系统任务，直接同步执行 start，并加入待更新列表
+            // 遍历原始 outcome 中的待调度任务（注意：这里用的是 outcome.tasksToBeScheduled，
+            // 而不是去重后的 tasksToBeScheduled，因为去重后的列表可能已过滤掉部分任务）
             for (TaskModel task : outcome.tasksToBeScheduled) {
+                // 填充任务数据（如输入参数、上下文等），确保执行时数据完整
                 executionDAOFacade.populateTaskData(task);
+
+                // 判断该任务是否为系统任务，且仍处于非终态（即需要执行）
                 if (systemTaskRegistry.isSystemTask(task.getTaskType())
                         && NON_TERMINAL_TASK.test(task)) {
+
+                    // 获取对应的系统任务实现
                     WorkflowSystemTask workflowSystemTask =
                             systemTaskRegistry.get(task.getTaskType());
+
+                    // 如果是同步系统任务，则直接在此处执行
+                    // execute 返回 true 表示任务执行后状态发生了变化（例如任务完成或推进）
                     if (!workflowSystemTask.isAsync()
                             && workflowSystemTask.execute(workflow, task, this)) {
+                        // 将执行后的任务加入待更新列表，以便持久化最新状态
                         tasksToBeUpdated.add(task);
+                        // 标记工作流状态已变化，后续会递归继续决策
                         stateChanged = true;
                     }
                 }
             }
 
+            // 如果有任务需要更新，或者有任务被调度，则批量更新任务
             if (!outcome.tasksToBeUpdated.isEmpty() || !tasksToBeScheduled.isEmpty()) {
                 executionDAOFacade.updateTasks(tasksToBeUpdated);
             }
 
-            // 状态有变化则递归继续 decide，直到稳定
+            // 如果状态有变化，则递归继续 decide，直到工作流达到稳定状态
+            // 递归是为了处理同步任务执行后可能引发的新任务调度或状态变更
             if (stateChanged) {
                 return decide(workflow);
             }
 
+            // 如果没有状态变化，但仍有任务更新或调度，则更新工作流本身
             if (!outcome.tasksToBeUpdated.isEmpty() || !tasksToBeScheduled.isEmpty()) {
                 executionDAOFacade.updateWorkflow(workflow);
             }
 
+            // 返回处理后的工作流对象
             return workflow;
 
         } catch (TerminateWorkflowException twe) {
-            // 终止异常：直接终止工作流
+            // 终止异常：表示工作流需要被强制终止（例如遇到不可恢复的错误）
             LOGGER.info("Execution terminated of workflow: {}", workflow, twe);
+            // 执行终止逻辑，将工作流置为终止状态
             terminate(workflow, twe);
             return workflow;
         } catch (RuntimeException e) {
+            // 其他运行时异常：记录错误日志后向上抛出，由上层处理
             LOGGER.error("Error deciding workflow: {}", workflow.getWorkflowId(), e);
             throw e;
         }

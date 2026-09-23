@@ -167,22 +167,45 @@ public class StartWorkflowOperation implements WorkflowOperation<StartWorkflowIn
         try {
             // 6. 加锁持久化 + 发布评估事件
             createAndEvaluate(workflow);
+
+            // 记录工作流启动成功的监控指标
             Monitors.recordWorkflowStartSuccess(
                     workflow.getWorkflowName(),
                     String.valueOf(workflow.getWorkflowVersion()),
                     workflow.getOwnerApp());
+
+            // 返回本次启动创建的工作流实例 ID，供调用方后续使用（如查询状态、关联任务等）
             return workflowId;
         } catch (Exception e) {
+            // 捕获启动过程中的任何异常，进行错误监控上报与资源清理
+
+            // 记录工作流启动失败的监控指标
+            // 参数说明：
+            //   - workflowDefinition.getName()             : 工作流定义的名称（注意此处用的是定义对象而非实例对象）
+            //   - WorkflowContext.get().getClientApp()     : 当前线程上下文中记录的客户端应用标识，便于定位是哪个调用方触发的失败
             Monitors.recordWorkflowStartError(
                     workflowDefinition.getName(), WorkflowContext.get().getClientApp());
+
+            // 记录错误日志，包含工作流定义名称与完整异常堆栈，便于问题排查
             LOGGER.error("Unable to start workflow: {}", workflowDefinition.getName(), e);
 
             // 启动失败：尝试清理已创建的工作流（可能只创建了一半）
+            // 说明：由于 createAndEvaluate 内部可能包含多步操作（如先写库再发事件），
+            //      若中途抛出异常，可能已在存储层留下不完整的数据，因此需要尽力回滚清理。
             try {
+                // 调用 DAO 门面删除该工作流记录
+                // 第二个参数 false 通常表示"非强制删除"或"不做级联删除"等语义（具体取决于实现），
+                // 即仅移除主记录，不递归清理关联的子任务/子流程，避免误删或性能开销。
                 executionDAOFacade.removeWorkflow(workflowId, false);
             } catch (Exception rwe) {
+                // 清理操作本身也可能失败（如数据库连接异常、记录已被其他线程删除等），
+                // 此处单独捕获并记录日志，避免清理异常覆盖原始业务异常（e），
+                // 保证最终抛出给上层的仍是导致启动失败的根本原因。
                 LOGGER.error("Could not remove the workflowId: " + workflowId, rwe);
             }
+
+            // 将原始异常 e 向上抛出，由上层调用者决定如何处理（如返回错误码、重试等）
+            // 注意：这里抛出的是原始异常而非清理异常，确保调用方能看到真正的失败原因
             throw e;
         }
     }

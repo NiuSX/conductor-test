@@ -17,134 +17,153 @@ import java.util.Map;
 
 import com.netflix.conductor.core.events.queue.Message;
 
-/** DAO responsible for managing queuing for the tasks. */
+/** 负责管理任务队列的 DAO 接口。 */
 public interface QueueDAO {
 
     /**
-     * @param queueName name of the queue
-     * @param id message id
-     * @param offsetTimeInSecond time in seconds, after which the message should be marked visible.
-     *     (for timed queues)
+     * 把一条消息推入队列。
+     *
+     * @param queueName 队列名称
+     * @param id 消息 id
+     * @param offsetTimeInSecond 延迟秒数，经过该时间后消息才会变为可见（用于定时队列）
      */
     void push(String queueName, String id, long offsetTimeInSecond);
 
     /**
-     * @param queueName name of the queue
-     * @param id message id
-     * @param priority message priority (between 0 and 99)
-     * @param offsetTimeInSecond time in seconds, after which the message should be marked visible.
-     *     (for timed queues)
+     * 把一条带优先级的消息推入队列。
+     *
+     * @param queueName 队列名称
+     * @param id 消息 id
+     * @param priority 消息优先级（0 到 99 之间）
+     * @param offsetTimeInSecond 延迟秒数，经过该时间后消息才会变为可见（用于定时队列）
      */
     void push(String queueName, String id, int priority, long offsetTimeInSecond);
 
     /**
-     * @param queueName Name of the queue
-     * @param messages messages to be pushed.
+     * 批量把消息推入队列。
+     *
+     * @param queueName 队列名称
+     * @param messages 要推入的消息列表
      */
     void push(String queueName, List<Message> messages);
 
     /**
-     * @param queueName Name of the queue
-     * @param id message id
-     * @param offsetTimeInSecond time in seconds, after which the message should be marked visible.
-     *     (for timed queues)
-     * @return true if the element was added to the queue. false otherwise indicating the element
-     *     already exists in the queue.
+     * 仅当消息不存在时才推入队列。
+     *
+     * @param queueName 队列名称
+     * @param id 消息 id
+     * @param offsetTimeInSecond 延迟秒数，经过该时间后消息才会变为可见（用于定时队列）
+     * @return 若消息被成功加入返回 true；若消息已存在返回 false
      */
     boolean pushIfNotExists(String queueName, String id, long offsetTimeInSecond);
 
     /**
-     * @param queueName Name of the queue
-     * @param id message id
-     * @param priority message priority (between 0 and 99)
-     * @param offsetTimeInSecond time in seconds, after which the message should be marked visible.
-     *     (for timed queues)
-     * @return true if the element was added to the queue. false otherwise indicating the element
-     *     already exists in the queue.
+     * 仅当消息不存在时才推入队列（带优先级）。
+     *
+     * @param queueName 队列名称
+     * @param id 消息 id
+     * @param priority 消息优先级（0 到 99 之间）
+     * @param offsetTimeInSecond 延迟秒数，经过该时间后消息才会变为可见（用于定时队列）
+     * @return 若消息被成功加入返回 true；若消息已存在返回 false
      */
     boolean pushIfNotExists(String queueName, String id, int priority, long offsetTimeInSecond);
 
     /**
-     * @param queueName Name of the queue
-     * @param count number of messages to be read from the queue
-     * @param timeout timeout in milliseconds
-     * @return list of elements from the named queue
+     * 从队列中弹出消息 id。
+     *
+     * @param queueName 队列名称
+     * @param count 要读取的消息数量
+     * @param timeout 超时时间（毫秒）
+     * @return 队列中的消息 id 列表
      */
     List<String> pop(String queueName, int count, int timeout);
 
     /**
-     * @param queueName Name of the queue
-     * @param count number of messages to be read from the queue
-     * @param timeout timeout in milliseconds
-     * @return list of elements from the named queue
+     * 从队列中拉取消息（含消息体）。
+     *
+     * @param queueName 队列名称
+     * @param count 要读取的消息数量
+     * @param timeout 超时时间（毫秒）
+     * @return 队列中的消息列表
      */
     List<Message> pollMessages(String queueName, int count, int timeout);
 
     /**
-     * @param queueName Name of the queue
-     * @param messageId Message id
+     * 从队列中移除指定消息。
+     *
+     * @param queueName 队列名称
+     * @param messageId 消息 id
      */
     void remove(String queueName, String messageId);
 
     /**
-     * @param queueName Name of the queue
-     * @return size of the queue
+     * 获取队列当前大小。
+     *
+     * @param queueName 队列名称
+     * @return 队列大小
      */
     int getSize(String queueName);
 
     /**
-     * @param queueName Name of the queue
-     * @param messageId Message Id
-     * @return true if the message was found and ack'ed
+     * 确认（ack）消息已处理完成。
+     *
+     * @param queueName 队列名称
+     * @param messageId 消息 id
+     * @return 若找到消息并成功 ack 返回 true
      */
     boolean ack(String queueName, String messageId);
 
     /**
-     * Extend the lease of the unacknowledged message for longer period.
+     * 延长未确认消息的租约（延长可见性超时）。
      *
-     * @param queueName Name of the queue
-     * @param messageId Message Id
-     * @param unackTimeout timeout in milliseconds for which the unack lease should be extended.
-     *     (replaces the current value with this value)
-     * @return true if the message was updated with extended lease. false otherwise.
+     * @param queueName 队列名称
+     * @param messageId 消息 id
+     * @param unackTimeout 未确认租约延长的毫秒数（会替换当前值）
+     * @return 若成功延长租约返回 true；否则返回 false
      */
     boolean setUnackTimeout(String queueName, String messageId, long unackTimeout);
 
     /**
-     * @param queueName Name of the queue
+     * 清空指定队列。
+     *
+     * @param queueName 队列名称
      */
     void flush(String queueName);
 
     /**
-     * @return key : queue name, value: size of the queue
+     * 获取所有队列的概要信息。
+     *
+     * @return key 为队列名，value 为队列大小
      */
     Map<String, Long> queuesDetail();
 
     /**
-     * @return key : queue name, value: map of shard name to size and unack queue size
+     * 获取所有队列的详细信息。
+     *
+     * @return key 为队列名，value 为「分片名 → (大小、未确认队列大小)」的映射
      */
     Map<String, Map<String, Map<String, Long>>> queuesDetailVerbose();
 
+    /** 处理未确认消息（默认空实现，具体实现可按需覆盖）。 */
     default void processUnacks(String queueName) {}
 
     /**
-     * Resets the offsetTime on a message to 0, without pulling out the message from the queue
+     * 把消息的延迟时间重置为 0，且不把消息从队列中取出。
      *
-     * @param queueName name of the queue
-     * @param id message id
-     * @return true if the message is in queue and the change was successful else returns false
+     * @param queueName 队列名称
+     * @param id 消息 id
+     * @return 若消息在队列中且修改成功返回 true，否则返回 false
      */
     boolean resetOffsetTime(String queueName, String id);
 
     /**
-     * Postpone a given message with postponeDurationInSeconds, so that the message won't be
-     * available for further polls until specified duration. By default, the message is removed and
-     * pushed backed with postponeDurationInSeconds to be backwards compatible.
+     * 将消息推迟 postponeDurationInSeconds 秒，使其在指定时间内不会被再次拉取。
+     * 默认实现为向后兼容采用「先移除再按延迟重新推入」的方式。
      *
-     * @param queueName name of the queue
-     * @param messageId message id
-     * @param priority message priority (between 0 and 99)
-     * @param postponeDurationInSeconds duration in seconds by which the message is to be postponed
+     * @param queueName 队列名称
+     * @param messageId 消息 id
+     * @param priority 消息优先级（0 到 99 之间）
+     * @param postponeDurationInSeconds 推迟的秒数
      */
     default boolean postpone(
             String queueName, String messageId, int priority, long postponeDurationInSeconds) {
@@ -154,11 +173,11 @@ public interface QueueDAO {
     }
 
     /**
-     * Check if the message with given messageId exists in the Queue.
+     * 检查指定 messageId 的消息是否存在于队列中。
      *
-     * @param queueName
-     * @param messageId
-     * @return
+     * @param queueName 队列名称
+     * @param messageId 消息 id
+     * @return 若存在返回 true
      */
     default boolean containsMessage(String queueName, String messageId) {
         throw new UnsupportedOperationException(

@@ -120,7 +120,6 @@ public class DeciderService {
 
     /**
      * decide 的核心实现：基于当前任务状态推导下一步。
-     *
      * 流程：
      * 1. 终态/暂停工作流直接返回
      * 2. 检查工作流超时
@@ -128,13 +127,18 @@ public class DeciderService {
      * 4. 对每个 pending 任务：检查超时/轮询超时、决定是否重试
      * 5. 对终态任务：标记 executed，计算下一个任务
      * 6. 汇总待调度任务，判断工作流是否完成
+     * 核心决策方法：根据工作流当前状态，计算出"下一步该做什么"。
      */
+
     private DeciderOutcome decide(final WorkflowModel workflow, List<TaskModel> preScheduledTasks)
             throws TerminateWorkflowException {
 
+        // 创建决策结果容器，用于收集本次决策产出的所有信息
         DeciderOutcome outcome = new DeciderOutcome();
 
         // 终态工作流不可再评估
+        // 若工作流已处于 COMPLETED/FAILED/TERMINATED/TIMED_OUT 等终态，
+        // 直接返回空 outcome，避免对已结束的工作流做无意义推进。
         if (workflow.getStatus().isTerminal()) {
             LOGGER.debug(
                     "Workflow {} is already finished. Reason: {}",
@@ -144,30 +148,42 @@ public class DeciderService {
         }
 
         // 检查工作流级超时
+        // 若工作流定义了 workflowTimeoutSeconds 且已超时，
+        // 会在此处抛出 TerminateWorkflowException，由上层终止工作流。
         checkWorkflowTimeout(workflow);
 
         // 暂停的工作流不推进
+        // PAUSED 状态的工作流应保持挂起，不调度新任务、不计算下游。
         if (workflow.getStatus().equals(WorkflowModel.Status.PAUSED)) {
             LOGGER.debug("Workflow " + workflow.getWorkflowId() + " is paused");
             return outcome;
         }
 
+        // pending 任务集合：未重试、未跳过、未执行的任务（即"待处理"的任务）
         List<TaskModel> pendingTasks = new ArrayList<>();
+        // 已执行任务的引用名集合：用于最终过滤，避免重复调度同一任务
         Set<String> executedTaskRefNames = new HashSet<>();
+        // 是否存在成功的 TERMINATE 任务：用于判断工作流是否应结束
         boolean hasSuccessfulTerminateTask = false;
+
+        // 遍历工作流中的所有任务，进行分类收集
         for (TaskModel task : workflow.getTasks()) {
 
-            // 收集"未重试、未执行、未跳过"的 pending 任务
+            // 收集"未重试、未跳过、未执行"的 pending 任务
+            // 这类任务还未被处理过，需要在本次决策中考虑其超时/重试/下游
             if (!task.isRetried() && !task.getStatus().equals(SKIPPED) && !task.isExecuted()) {
                 pendingTasks.add(task);
             }
 
             // 收集已执行任务的引用名
+            // 已执行的任务不应再被调度，最后会用这个集合过滤掉重复项
             if (task.isExecuted()) {
                 executedTaskRefNames.add(task.getReferenceTaskName());
             }
 
             // 记录成功的 TERMINATE 任务（用于结束工作流）
+            // TERMINATE 是特殊系统任务：当其成功执行时，表示工作流应主动结束。
+            // 此处保存该任务到 outcome.terminateTask，供 endExecution 使用。
             if (TERMINATE.name().equals(task.getTaskType())
                     && task.getStatus().isTerminal()
                     && task.getStatus().isSuccessful()) {
@@ -176,9 +192,13 @@ public class DeciderService {
             }
         }
 
+        // 待调度任务映射：key = referenceTaskName，value = 任务模型
+        // 用 LinkedHashMap 保证插入顺序（即调度顺序），且用 putIfAbsent 去重。
         Map<String, TaskModel> tasksToBeScheduled = new LinkedHashMap<>();
 
         // 预先调度的任务先放入 map
+        // preScheduledTasks 通常来自 DO_WHILE 循环的首次迭代任务，
+        // 这些任务已被调用方确定要调度，直接加入即可。
         preScheduledTasks.forEach(
                 preScheduledTask -> {
                     tasksToBeScheduled.put(
@@ -186,15 +206,20 @@ public class DeciderService {
                 });
 
         // 新工作流不会进入这个循环
+        // （新工作流没有 pending 任务，pendingTasks 为空，循环体不执行）
         for (TaskModel pendingTask : pendingTasks) {
 
             // 非终态的系统任务：加入待调度，并从已执行集合移除
+            // 系统任务（如 JOIN、FORK、DECISION 等）若仍处于非终态，
+            // 需要重新纳入调度，以推进其状态。同时从 executedTaskRefNames 移除，
+            // 避免后续过滤时被误判为"已执行"。
             if (systemTaskRegistry.isSystemTask(pendingTask.getTaskType())
                     && !pendingTask.getStatus().isTerminal()) {
                 tasksToBeScheduled.putIfAbsent(pendingTask.getReferenceTaskName(), pendingTask);
                 executedTaskRefNames.remove(pendingTask.getReferenceTaskName());
             }
 
+            // 获取任务定义：优先从任务自身获取，否则从工作流定义中按 refName 查找
             Optional<TaskDef> taskDefinition = pendingTask.getTaskDefinition();
             if (taskDefinition.isEmpty()) {
                 taskDefinition =
@@ -205,8 +230,11 @@ public class DeciderService {
                                 .map(WorkflowTask::getTaskDefinition);
             }
 
+            // 若找到任务定义，进行超时检查
             if (taskDefinition.isPresent()) {
+                // 检查任务级超时（任务执行总时长）
                 checkTaskTimeout(taskDefinition.get(), pendingTask);
+                // 检查任务轮询超时（worker 是否在 timeoutSeconds 内轮询）
                 checkTaskPollTimeout(taskDefinition.get(), pendingTask);
                 // 若任务超过 responseTimeoutSeconds 未更新，标记为 TIMED_OUT
                 if (isResponseTimedOut(taskDefinition.get(), pendingTask)) {
@@ -215,7 +243,9 @@ public class DeciderService {
             }
 
             // 任务未成功：尝试重试
+            // 若任务处于 FAILED/TIMED_OUT 等非成功状态，尝试为其生成重试任务。
             if (!pendingTask.getStatus().isSuccessful()) {
+                // 获取该任务对应的 WorkflowTask 定义（可能为 null，需回退到定义中查找）
                 WorkflowTask workflowTask = pendingTask.getWorkflowTask();
                 if (workflowTask == null) {
                     workflowTask =
@@ -223,36 +253,51 @@ public class DeciderService {
                                     .getTaskByRefName(pendingTask.getReferenceTaskName());
                 }
 
+                // 尝试生成重试任务；若返回 Optional 非空，说明可重试
                 Optional<TaskModel> retryTask =
                         retry(taskDefinition.orElse(null), workflowTask, pendingTask, workflow);
                 if (retryTask.isPresent()) {
                     // 有重试任务：加入待调度
                     tasksToBeScheduled.put(retryTask.get().getReferenceTaskName(), retryTask.get());
+                    // 从已执行集合移除，确保重试任务不会被误过滤
                     executedTaskRefNames.remove(retryTask.get().getReferenceTaskName());
+                    // 原任务需要被更新（标记为已重试）
                     outcome.tasksToBeUpdated.add(pendingTask);
                 } else {
                     // 无可重试：标记为 COMPLETED_WITH_ERRORS
+                    // 表示该任务虽未成功，但已无重试机会，作为"带错误完成"处理。
                     pendingTask.setStatus(COMPLETED_WITH_ERRORS);
                 }
             }
 
             // 终态且未执行的任务：标记 executed，计算下一个任务
+            // 任务进入终态后，需要推进工作流：计算其下游任务（next tasks）并纳入调度。
             if (!pendingTask.isExecuted()
                     && !pendingTask.isRetried()
                     && pendingTask.getStatus().isTerminal()) {
+                // 标记为已执行，避免下次决策重复处理
                 pendingTask.setExecuted(true);
+
+                // 计算下游任务：根据工作流定义的连线关系，找出该任务之后的 next 任务
                 List<TaskModel> nextTasks = getNextTask(workflow, pendingTask);
+
                 // 循环任务：过滤出本次迭代还没跑的下游任务
+                // 对于 DO_WHILE 中的循环任务（非 DO_WHILE 本身），需要按迭代号过滤，
+                // 避免把其他迭代的任务重复加入。
                 if (pendingTask.isLoopOverTask()
                         && !TaskType.DO_WHILE.name().equals(pendingTask.getTaskType())
                         && !nextTasks.isEmpty()) {
                     nextTasks = filterNextLoopOverTasks(nextTasks, pendingTask, workflow);
                 }
+
+                // 将下游任务加入待调度（putIfAbsent 保证不覆盖已有）
                 nextTasks.forEach(
                         nextTask ->
                                 tasksToBeScheduled.putIfAbsent(
                                         nextTask.getReferenceTaskName(), nextTask));
+                // 当前任务需要被更新（executed=true 已变更）
                 outcome.tasksToBeUpdated.add(pendingTask);
+
                 LOGGER.debug(
                         "Scheduling Tasks from {}, next = {} for workflowId: {}",
                         pendingTask.getTaskDefName(),
@@ -264,6 +309,8 @@ public class DeciderService {
         }
 
         // 过滤掉已执行的任务，得到最终待调度列表
+        // 某些任务可能同时出现在 tasksToBeScheduled 和 executedTaskRefNames 中
+        // （例如被重复加入），此处统一过滤，确保不会重复调度。
         List<TaskModel> unScheduledTasks =
                 tasksToBeScheduled.values().stream()
                         .filter(task -> !executedTaskRefNames.contains(task.getReferenceTaskName()))
@@ -275,16 +322,21 @@ public class DeciderService {
                             .map(TaskModel::getTaskDefName)
                             .collect(Collectors.toList()),
                     workflow.getWorkflowId());
+            // 将最终待调度任务写入 outcome
             outcome.tasksToBeScheduled.addAll(unScheduledTasks);
         }
 
         // 判断工作流是否完成
+        // 满足以下任一条件即视为完成：
+        //   1. 存在成功的 TERMINATE 任务（工作流被主动结束）
+        //   2. 没有任何待调度任务，且 checkForWorkflowCompletion 判定所有任务都已结束
         if (hasSuccessfulTerminateTask
                 || (outcome.tasksToBeScheduled.isEmpty() && checkForWorkflowCompletion(workflow))) {
             LOGGER.debug("Marking workflow: {} as complete.", workflow);
             outcome.isComplete = true;
         }
 
+        // 返回决策结果，由调用方（WorkflowExecutor.decide）负责调度与持久化
         return outcome;
     }
 

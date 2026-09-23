@@ -16,14 +16,26 @@ import java.io.Serializable;
 
 import com.netflix.conductor.core.execution.StartWorkflowInput;
 
+/**
+ * 工作流创建事件
+ */
 public class WorkflowCreationEvent implements Serializable {
 
+    /**
+     * 启动工作流的输入参数
+     */
     private final StartWorkflowInput startWorkflowInput;
 
+    /**
+     * 构造方法：创建 WorkflowCreationEvent 实例
+     */
     public WorkflowCreationEvent(StartWorkflowInput startWorkflowInput) {
         this.startWorkflowInput = startWorkflowInput;
     }
 
+    /**
+     * 获取启动工作流的输入参数
+     */
     public StartWorkflowInput getStartWorkflowInput() {
         return startWorkflowInput;
     }
